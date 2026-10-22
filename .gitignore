@@ -1,0 +1,9 @@
+# 本地配置（含密码与令牌），不要提交
+config.yaml
+.env
+
+# 构建产物
+/bin/
+/dist/
+*.test
+coverage.out

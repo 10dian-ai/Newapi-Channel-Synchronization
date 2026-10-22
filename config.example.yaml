@@ -1,0 +1,77 @@
+# newapi-sync 配置示例
+# 复制为 config.yaml 后按需修改。支持 ${环境变量} 与 ${环境变量:-默认值}，
+# 推荐把数据库密码、访问令牌写在 .env 里，配置文件只引用变量名。
+
+# ---------------- 主站（只读） ----------------
+master:
+  name: master
+  database:
+    # 与 NewAPI 的 SQL_DSN 写法相同：
+    #   MySQL:      用户名:密码@tcp(主机:3306)/数据库名
+    #   PostgreSQL: postgresql://用户名:密码@主机:5432/数据库名
+    # 强烈建议使用只有 SELECT 权限的账号（见 README）。
+    dsn: "${MASTER_DSN}"
+
+# ---------------- 子站（可以有多个） ----------------
+children:
+  - name: child1
+    database:
+      dsn: "${CHILD1_DSN}"
+    # 子站管理接口：配置后，写库完成会立刻让子站生效（推荐配置）
+    api:
+      base_url: "${CHILD1_URL}"
+      # 在子站用超级管理员账号创建访问令牌，勾选 channel:operate 与 option:write 两个权限
+      access_token: "${CHILD1_TOKEN}"
+      # 旧版本 NewAPI 需要 New-Api-User 请求头时填写令牌所属用户 ID，新版本留空
+      # user_id: 1
+      # refresh_channels: fix   # fix=写库后调用子站修复接口刷新缓存（默认）；none=等子站自己刷新
+      # options_via: api        # api=分组设置走子站接口，立即生效（默认）；db=直接写库
+
+  - name: child2
+    # enabled: false            # 临时停止同步这个子站
+    # dry_run: true             # 只看差异不写入（单独对这个子站生效）
+    database:
+      dsn: "${CHILD2_DSN}"
+    # 没有配置 api 时：渠道与分组直接写库，子站按自己的 SYNC_FREQUENCY 周期刷新后生效
+
+# ---------------- 同步节奏 ----------------
+sync:
+  poll_interval: 1s        # 探测主站变化的间隔（每次只执行一条校验和查询）
+  debounce: 300ms          # 发现变化后等待多久再读取，用来合并连续修改
+  reconcile_interval: 5m   # 定期全量对账，兜底任何遗漏或子站被手动改动
+  retry_min: 2s            # 失败后的重试间隔（指数退避）
+  retry_max: 1m
+  dry_run: false           # 全局演练模式：只计算并记录差异，不写入
+  on_schema_change: continue  # 子站升级导致表结构变化时：continue=按新结构继续；pause=暂停该子站并告警
+  # delete_missing: true   # 删除主站已不存在的渠道（默认 true）
+
+# ---------------- 渠道字段归属 ----------------
+channels:
+  # smart（默认）：主站手动禁用会同步；子站自己自动禁用的渠道保持禁用，由子站自己的检测恢复
+  # mirror：渠道状态与主站完全一致
+  status_mode: smart
+  # 默认由子站自己维护、不会被覆盖的字段：
+  #   used_quota, balance, balance_updated_time, response_time, test_time, other_info
+  # 想额外保留子站自己的某些字段时追加在这里：
+  # extra_child_owned_columns: [remark]
+
+# ---------------- 分组设置 ----------------
+options:
+  # enabled: true
+  # 默认同步：GroupRatio, GroupGroupRatio, UserUsableGroups, AutoGroups, DefaultUseAutoGroup
+  # 以及 group_ratio_setting.* 前缀。需要同步更多设置时（例如模型倍率）在这里列出完整清单：
+  # keys: [GroupRatio, GroupGroupRatio, UserUsableGroups, AutoGroups, DefaultUseAutoGroup, ModelRatio]
+  # key_prefixes: ["group_ratio_setting."]
+
+# ---------------- 状态接口 ----------------
+http:
+  listen: ":8090"          # /healthz /status /metrics；设为 "off" 关闭
+
+log:
+  level: info              # debug / info / warn / error
+  format: text             # text / json
+
+notify:
+  # 同步连续失败、子站结构变化时 POST JSON 到这个地址
+  webhook_url: ""
+  failure_threshold: 3

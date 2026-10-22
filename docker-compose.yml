@@ -1,0 +1,38 @@
+# 部署：
+#   1. cp config.example.yaml config.yaml && cp .env.example .env，然后按实际填写
+#   2. docker compose run --rm newapi-sync check     # 检查连接并演练一次，不写入
+#   3. docker compose up -d                          # 正式启动
+# 更新：
+#   docker compose pull && docker compose up -d
+services:
+  newapi-sync:
+    image: ghcr.io/10dian-ai/newapi-channel-synchronization:latest
+    container_name: newapi-sync
+    restart: unless-stopped
+    env_file: .env
+    volumes:
+      - ./config.yaml:/app/config.yaml:ro
+    ports:
+      # 状态接口只开放给本机；需要远程查看时改成 "8090:8090" 并自行加访问控制
+      - "127.0.0.1:8090:8090"
+    logging:
+      driver: json-file
+      options:
+        max-size: "20m"
+        max-file: "3"
+    # 如果 NewAPI 的数据库在同一台机器的 docker 网络里，把这里改成那个网络名，
+    # DSN 里直接写数据库容器名即可
+    # networks:
+    #   - new-api_default
+
+# networks:
+#   new-api_default:
+#     external: true
+
+# 可选：自动更新（每天检查一次新镜像）
+#  watchtower:
+#    image: containrrr/watchtower
+#    restart: unless-stopped
+#    volumes:
+#      - /var/run/docker.sock:/var/run/docker.sock
+#    command: --interval 86400 newapi-sync

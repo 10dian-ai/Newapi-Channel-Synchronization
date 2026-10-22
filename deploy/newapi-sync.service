@@ -1,0 +1,26 @@
+# 不用 Docker 时的 systemd 部署方式：
+#   1. 从 GitHub Releases 下载对应架构的二进制，放到 /usr/local/bin/newapi-sync
+#   2. mkdir -p /etc/newapi-sync，放入 config.yaml 和 .env（chmod 600）
+#   3. cp deploy/newapi-sync.service /etc/systemd/system/ && systemctl daemon-reload
+#   4. newapi-sync -config /etc/newapi-sync/config.yaml check   # 先演练
+#   5. systemctl enable --now newapi-sync
+# 更新：替换二进制后 systemctl restart newapi-sync
+[Unit]
+Description=NewAPI channel & group synchronization
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+EnvironmentFile=-/etc/newapi-sync/.env
+ExecStart=/usr/local/bin/newapi-sync -config /etc/newapi-sync/config.yaml run
+Restart=always
+RestartSec=5
+DynamicUser=yes
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,42 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    services:
+      mysql:
+        image: mysql:8.0
+        env:
+          MYSQL_ROOT_PASSWORD: root
+        ports: ["3306:3306"]
+        options: >-
+          --health-cmd "mysqladmin ping -proot"
+          --health-interval 5s --health-timeout 5s --health-retries 20
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_PASSWORD: postgres
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 5s --health-timeout 5s --health-retries 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: gofmt
+        run: test -z "$(gofmt -l .)" || (gofmt -l . && exit 1)
+      - run: go vet ./...
+      - name: 单元测试
+        run: go test -race ./...
+      - name: 集成测试（真实 MySQL 与 PostgreSQL）
+        env:
+          NEWAPI_SYNC_TEST_MYSQL: "root:root@tcp(127.0.0.1:3306)/"
+          NEWAPI_SYNC_TEST_POSTGRES: "postgres://postgres:postgres@127.0.0.1:5432/postgres?sslmode=disable"
+        run: go test -count=1 -v ./internal/itest/
