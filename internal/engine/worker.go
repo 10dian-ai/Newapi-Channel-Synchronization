@@ -2,6 +2,7 @@ package engine
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"sync"
@@ -46,22 +47,24 @@ type worker struct {
 	pendingRefresh     bool
 	consecutiveFailure int
 	backoff            *backoff
+	notifiedWarnings   map[string]bool
 }
 
 func newWorker(cfg *config.Config, ch Child, log *slog.Logger, notifier notify.Notifier, status *Status) *worker {
 	w := &worker{
-		name:       ch.Config.Name,
-		cfg:        cfg,
-		child:      ch.Config,
-		store:      ch.Store,
-		api:        ch.API,
-		log:        log,
-		notifier:   notifier,
-		status:     status,
-		dryRun:     cfg.ChildDryRun(ch.Config),
-		wake:       make(chan struct{}, 1),
-		needSchema: true,
-		backoff:    newBackoff(cfg.Sync.RetryMin.D(), cfg.Sync.RetryMax.D()),
+		name:             ch.Config.Name,
+		cfg:              cfg,
+		child:            ch.Config,
+		store:            ch.Store,
+		api:              ch.API,
+		log:              log,
+		notifier:         notifier,
+		status:           status,
+		dryRun:           cfg.ChildDryRun(ch.Config),
+		wake:             make(chan struct{}, 1),
+		needSchema:       true,
+		backoff:          newBackoff(cfg.Sync.RetryMin.D(), cfg.Sync.RetryMax.D()),
+		notifiedWarnings: map[string]bool{},
 	}
 	status.updateChild(w.name, func(c *ChildStatus) {
 		c.DryRun = w.dryRun
@@ -165,11 +168,22 @@ func (w *worker) onSuccess(ctx context.Context) {
 	w.status.updateChild(w.name, func(c *ChildStatus) { c.ConsecutiveFailures = 0 })
 }
 
-// syncOnce 执行一次完整的同步：差异 → 写入 → 生效 → 校验。
-func (w *worker) syncOnce(ctx context.Context, snap *snapshot.Master) error {
+// syncOnce 执行一次完整的同步：差异 → 写入 → 生效 → 校验。整个过程有超时，
+// 子站数据库锁等待或连接卡住时不会让这个子站永远停在"同步中"。
+func (w *worker) syncOnce(parent context.Context, snap *snapshot.Master) error {
 	if w.paused {
 		return nil
 	}
+	ctx, cancel := context.WithTimeout(parent, w.cfg.Sync.Timeout.D())
+	defer cancel()
+	err := w.doSync(ctx, snap)
+	if err != nil && errors.Is(ctx.Err(), context.DeadlineExceeded) && parent.Err() == nil {
+		return fmt.Errorf("同步超时（超过 %s）：%w", w.cfg.Sync.Timeout.D(), err)
+	}
+	return err
+}
+
+func (w *worker) doSync(ctx context.Context, snap *snapshot.Master) error {
 	start := time.Now()
 	w.status.updateChild(w.name, func(c *ChildStatus) {
 		c.LastAttemptAt = ptrTime(start)
@@ -190,18 +204,22 @@ func (w *worker) syncOnce(ctx context.Context, snap *snapshot.Master) error {
 	syncOptions := w.cfg.Options.IsEnabled()
 	cp := reconcile.BuildColumnPlan(snap.Channels.Columns, w.schema.Channels, w.cfg.Channels.OwnedColumns())
 	diffOpt := reconcile.DiffOptions{
-		StatusMode:    w.cfg.Channels.StatusMode,
-		DeleteMissing: w.cfg.Sync.ShouldDeleteMissing(),
-		SyncOptions:   syncOptions && len(w.schema.Options) > 0,
+		StatusMode:       w.cfg.Channels.StatusMode,
+		DeleteMissing:    w.cfg.Sync.ShouldDeleteMissing(),
+		SyncOptions:      syncOptions && len(w.schema.Options) > 0,
+		ExcludeType:      w.cfg.Channels.Excluded,
+		DeleteGuardRatio: w.cfg.Sync.GuardRatio(),
+		DeleteGuardMin:   w.cfg.Sync.DeleteGuardMin,
+		// 能力表由同步服务负责时（没有用子站修复接口）才校验；否则以子站自己的重建结果为准
+		CheckAbilities: w.abilitiesWritable && w.child.API.RefreshChannels != config.RefreshFix,
 	}
-	state, err := w.store.Load(ctx, w.schema, diffOpt.SyncOptions)
+	loadOpt := target.LoadOptions{Options: diffOpt.SyncOptions, Abilities: diffOpt.CheckAbilities}
+	state, err := w.store.Load(ctx, w.schema, loadOpt)
 	if err != nil {
 		return fmt.Errorf("读取子站失败：%w", err)
 	}
 	plan := reconcile.Diff(snap, state, cp, diffOpt)
-	for _, warn := range plan.Warnings {
-		w.log.Warn(warn)
-	}
+	w.handleWarnings(ctx, plan.Warnings)
 	if len(plan.OrphanOptions) > 0 && snap.Full {
 		w.log.Info("子站有主站没有的分组设置项，已保留不动", "keys", plan.OrphanOptions)
 	}
@@ -264,12 +282,17 @@ func (w *worker) syncOnce(ctx context.Context, snap *snapshot.Master) error {
 	}
 
 	// 写后校验：重新读取子站，确认已经与主站一致
-	after, err := w.store.Load(ctx, w.schema, diffOpt.SyncOptions)
+	after, err := w.store.Load(ctx, w.schema, loadOpt)
 	if err != nil {
 		return fmt.Errorf("写后校验读取子站失败：%w", err)
 	}
-	if remain := reconcile.Diff(snap, after, cp, diffOpt); !remain.Empty() {
+	remain := reconcile.Diff(snap, after, cp, diffOpt)
+	if remain.ChannelsChanged() || len(remain.Options) > 0 {
 		return fmt.Errorf("写后校验未通过，仍有差异：%s", remain.Summary())
+	}
+	if len(remain.AbilityRepairs) > 0 {
+		// 渠道已经一致，只是能力表还有出入（例如子站在这期间又改了渠道状态）：下一轮会再修，不算失败
+		w.log.Warn("写后校验发现能力表仍有不一致，下一轮同步会继续修复", "channels", remain.AbilityRepairs)
 	}
 
 	w.status.updateChild(w.name, func(c *ChildStatus) {
@@ -283,6 +306,20 @@ func (w *worker) syncOnce(ctx context.Context, snap *snapshot.Master) error {
 	w.markSynced(snap, plan, after, true)
 	w.log.Info("同步完成并已校验", "plan", plan.Summary(), "lag", lagOf(snap).Truncate(time.Millisecond))
 	return nil
+}
+
+// handleWarnings 记录警告；新出现的警告发一次告警，消失后再出现会再发。
+func (w *worker) handleWarnings(ctx context.Context, warns []string) {
+	current := map[string]bool{}
+	for _, warn := range warns {
+		current[warn] = true
+		if w.notifiedWarnings[warn] {
+			w.log.Warn(warn)
+			continue
+		}
+		w.notifier.Notify(ctx, notify.Event{Type: notify.EventWarning, Child: w.name, Message: warn, Time: time.Now()})
+	}
+	w.notifiedWarnings = current
 }
 
 func (w *worker) refreshChannels(ctx context.Context) error {

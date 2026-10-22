@@ -26,6 +26,7 @@ const (
 	EventSyncRecovered = "sync_recovered"
 	EventSchemaChanged = "schema_changed"
 	EventPaused        = "paused"
+	EventWarning       = "warning"
 )
 
 // Notifier 发送告警。

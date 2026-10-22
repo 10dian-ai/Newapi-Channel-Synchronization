@@ -59,7 +59,10 @@ func Build(ctx context.Context, cfg *config.Config, log *slog.Logger) (*App, err
 		return nil, fmt.Errorf("主站：%w", err)
 	}
 	a.closers = append(a.closers, masterDB.Close)
-	masterID := masterDB.Identity(ctx)
+	masterID, err := masterDB.Identities(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("主站：%w", err)
+	}
 	log.Info("已连接主站（只读）", "type", masterDB.Dialect.Name())
 
 	master, err := source.New(masterDB, matcher, cfg.Channels.OwnedColumns())
@@ -81,8 +84,19 @@ func Build(ctx context.Context, cfg *config.Config, log *slog.Logger) (*App, err
 			return nil, fmt.Errorf("子站 %s：%w", ch.Name, err)
 		}
 		a.closers = append(a.closers, db.Close)
-		if id := db.Identity(ctx); id != "" && id == masterID {
-			return nil, fmt.Errorf("子站 %s：%w", ch.Name, target.ErrSameDatabase)
+		// 防呆：子站绝不能指向主库。无法确认时同样拒绝启动。
+		childID, err := db.Identities(ctx)
+		if err != nil {
+			return nil, fmt.Errorf("子站 %s：%w", ch.Name, err)
+		}
+		if db.Dialect.Name() == masterDB.Dialect.Name() {
+			same, err := dbx.SameDatabase(masterID, childID)
+			if err != nil {
+				return nil, fmt.Errorf("子站 %s：%w", ch.Name, err)
+			}
+			if same {
+				return nil, fmt.Errorf("子站 %s：%w", ch.Name, target.ErrSameDatabase)
+			}
 		}
 		store := target.New(db, matcher)
 		if _, err := store.Schema(ctx); err != nil {

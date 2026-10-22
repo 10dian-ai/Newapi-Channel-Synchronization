@@ -146,6 +146,21 @@ type SyncConfig struct {
 	OnSchemaChange string `yaml:"on_schema_change"`
 	// DeleteMissing 删除主站已不存在的渠道，默认 true。
 	DeleteMissing *bool `yaml:"delete_missing"`
+	// DeleteGuardRatio / DeleteGuardMin 防误删：一次同步要删除的渠道数同时达到
+	// DeleteGuardMin 条、并超过子站渠道总数的 DeleteGuardRatio 时，跳过删除并告警。
+	// 默认 0.5 与 5；DeleteGuardRatio 设为 1 即关闭（例如首次接入、确认要清理子站旧渠道时）。
+	DeleteGuardRatio *float64 `yaml:"delete_guard_ratio"`
+	DeleteGuardMin   int      `yaml:"delete_guard_min"`
+	// Timeout 单个子站一次同步（含写入、刷新、校验）的最长时间，默认 2m。
+	Timeout Duration `yaml:"timeout"`
+}
+
+// GuardRatio 返回防误删比例。
+func (s SyncConfig) GuardRatio() float64 {
+	if s.DeleteGuardRatio == nil {
+		return 0.5
+	}
+	return *s.DeleteGuardRatio
 }
 
 // ShouldDeleteMissing 报告是否删除子站多余的渠道。
@@ -159,6 +174,19 @@ type ChannelsConfig struct {
 	ExtraChildOwnedColumns []string `yaml:"extra_child_owned_columns"`
 	// StatusMode 渠道状态同步模式：smart / mirror，默认 smart。
 	StatusMode string `yaml:"status_mode"`
+	// ExcludeTypes 不参与同步的渠道类型（NewAPI 的渠道类型编号）。这些类型的渠道
+	// 在子站完全由子站自己管理：不新增、不修改、不删除。
+	ExcludeTypes []int `yaml:"exclude_types"`
+}
+
+// Excluded 报告某个渠道类型是否不参与同步。
+func (c ChannelsConfig) Excluded(t int64) bool {
+	for _, x := range c.ExcludeTypes {
+		if int64(x) == t {
+			return true
+		}
+	}
+	return false
 }
 
 // OwnedColumns 返回最终生效的子站自有字段列表。
@@ -348,6 +376,12 @@ func (c *Config) ApplyDefaults() {
 	if s.OnSchemaChange == "" {
 		s.OnSchemaChange = SchemaChangeContinue
 	}
+	if s.DeleteGuardMin <= 0 {
+		s.DeleteGuardMin = 5
+	}
+	if s.Timeout <= 0 {
+		s.Timeout = Duration(2 * time.Minute)
+	}
 	if c.Channels.StatusMode == "" {
 		c.Channels.StatusMode = StatusModeSmart
 	}
@@ -457,6 +491,12 @@ func (c *Config) Validate() error {
 	if s.OnSchemaChange != SchemaChangeContinue && s.OnSchemaChange != SchemaChangePause {
 		add("sync.on_schema_change 只能是 continue 或 pause")
 	}
+	if r := s.GuardRatio(); r <= 0 || r > 1 {
+		add("sync.delete_guard_ratio 必须在 (0, 1] 之间（设为 1 表示关闭防误删）")
+	}
+	if s.Timeout.D() < 10*time.Second {
+		add("sync.timeout 不能小于 10s")
+	}
 
 	switch c.Channels.StatusMode {
 	case StatusModeSmart, StatusModeMirror:
@@ -464,11 +504,8 @@ func (c *Config) Validate() error {
 		add("channels.status_mode 只能是 smart 或 mirror")
 	}
 	for _, col := range c.Channels.OwnedColumns() {
-		switch col {
-		case "id":
-			add("channels 字段 id 是主键，不能设为子站自有")
-		case "key", "models", "group", "status":
-			// 允许，但这几个字段一旦设为子站自有，同步就失去主要意义，写日志提醒即可。
+		if col == "id" || col == "type" {
+			add("channels 字段 %s 不能设为子站自有", col)
 		}
 	}
 	for _, k := range c.Options.Keys {
@@ -502,6 +539,38 @@ func (c *Config) Validate() error {
 		return fmt.Errorf("配置校验失败：\n  - %s", strings.Join(errs, "\n  - "))
 	}
 	return nil
+}
+
+// Warnings 返回不阻止启动、但很可能不是本意的配置。
+func (c *Config) Warnings() []string {
+	var out []string
+	owned := map[string]bool{}
+	for _, col := range c.Channels.OwnedColumns() {
+		owned[col] = true
+	}
+	if len(c.Channels.ChildOwnedColumns) > 0 {
+		var missing []string
+		for _, col := range DefaultChildOwnedColumns {
+			if !owned[col] {
+				missing = append(missing, col)
+			}
+		}
+		if len(missing) > 0 {
+			out = append(out, fmt.Sprintf("channels.child_owned_columns 会替换默认列表，以下运行时字段将被主站的值覆盖：%s（只想追加请用 extra_child_owned_columns）", strings.Join(missing, ", ")))
+		}
+	}
+	for _, col := range []string{"key", "models", "group", "status", "base_url"} {
+		if owned[col] {
+			out = append(out, fmt.Sprintf("渠道字段 %s 被设为子站自有，主站对它的修改不会同步到子站", col))
+		}
+	}
+	for _, ch := range c.EnabledChildren() {
+		if ch.API.RefreshChannels == RefreshFix {
+			continue
+		}
+		out = append(out, fmt.Sprintf("子站 %s 未使用修复接口刷新：如果它开启了 Redis 或 MEMORY_CACHE_ENABLED，渠道改动要等它的 SYNC_FREQUENCY 周期后才生效", ch.Name))
+	}
+	return out
 }
 
 func validateDBType(t string) error {

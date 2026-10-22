@@ -27,8 +27,11 @@ type Master struct {
 	mu           sync.Mutex
 	schema       newapidb.Schema
 	probeQueries []probeQuery
-	probeBroken  bool
+	probeBroken  time.Time // 探测查询不可用的时间，过一段时间后再试
 }
+
+// probeRetryAfter 是探测查询不可用后多久再尝试一次。
+const probeRetryAfter = time.Minute
 
 type probeQuery struct {
 	sql  string
@@ -47,9 +50,6 @@ func New(db *dbx.DB, matcher newapidb.OptionMatcher, probeExclude []string) (*Ma
 	return &Master{db: db, matcher: matcher, probeExclude: ex}, nil
 }
 
-// DB 返回只读连接（用于身份检查）。
-func (m *Master) DB() *dbx.DB { return m.db }
-
 // RefreshSchema 重新读取主站表结构并重建探测查询。
 func (m *Master) RefreshSchema(ctx context.Context) (newapidb.Schema, error) {
 	tx, err := m.db.BeginRead(ctx)
@@ -65,7 +65,7 @@ func (m *Master) RefreshSchema(ctx context.Context) (newapidb.Schema, error) {
 	defer m.mu.Unlock()
 	m.schema = schema
 	m.probeQueries = m.buildProbes(schema)
-	m.probeBroken = false
+	m.probeBroken = time.Time{}
 	return schema, nil
 }
 
@@ -78,17 +78,23 @@ func (m *Master) Schema() newapidb.Schema {
 
 func (m *Master) buildProbes(schema newapidb.Schema) []probeQuery {
 	d := m.db.Dialect
-	var cols []string
+	var exprs []string
 	for _, c := range schema.Channels {
-		if !m.probeExclude[c.Name] {
-			cols = append(cols, c.Name)
+		if m.probeExclude[c.Name] {
+			continue
 		}
+		e := d.Quote(c.Name)
+		if c.Name == newapidb.ColChannelInfo {
+			// 多 Key 轮询下标在未开启内存缓存时每次请求都会写回，属于运行时状态
+			e = d.StripJSONKeyExpr(e, "multi_key_polling_index")
+		}
+		exprs = append(exprs, e)
 	}
-	probes := []probeQuery{{sql: d.ChecksumQuery(newapidb.TableChannels, cols, "")}}
+	probes := []probeQuery{{sql: d.ChecksumQuery(newapidb.TableChannels, exprs, "")}}
 	if len(schema.Options) > 0 && !m.matcher.Empty() {
 		where, args := m.matcher.WhereClause(d, 1)
 		probes = append(probes, probeQuery{
-			sql:  d.ChecksumQuery(newapidb.TableOptions, []string{newapidb.OptionKeyCol, newapidb.OptionValueCol}, where),
+			sql:  d.ChecksumQuery(newapidb.TableOptions, []string{d.Quote(newapidb.OptionKeyCol), d.Quote(newapidb.OptionValueCol)}, where),
 			args: args,
 		})
 	}
@@ -103,7 +109,7 @@ func (m *Master) Probe(ctx context.Context) (checksum string, supported bool, er
 	m.mu.Lock()
 	probes, broken := m.probeQueries, m.probeBroken
 	m.mu.Unlock()
-	if broken || len(probes) == 0 {
+	if len(probes) == 0 || (!broken.IsZero() && time.Since(broken) < probeRetryAfter) {
 		return "", false, nil
 	}
 	tx, err := m.db.BeginRead(ctx)
@@ -123,7 +129,7 @@ func (m *Master) Probe(ctx context.Context) (checksum string, supported bool, er
 				return "", true, fmt.Errorf("主站连接异常：%w", pingErr)
 			}
 			m.mu.Lock()
-			m.probeBroken = true
+			m.probeBroken = time.Now()
 			m.mu.Unlock()
 			return "", false, fmt.Errorf("校验和探测不可用，改为完整读取：%w", err)
 		}

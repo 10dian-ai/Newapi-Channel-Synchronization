@@ -33,7 +33,7 @@ type MasterSource interface {
 // ChildStore 是子站数据库。
 type ChildStore interface {
 	Schema(ctx context.Context) (newapidb.Schema, error)
-	Load(ctx context.Context, schema newapidb.Schema, withOptions bool) (*snapshot.Child, error)
+	Load(ctx context.Context, schema newapidb.Schema, opt target.LoadOptions) (*snapshot.Child, error)
 	Apply(ctx context.Context, plan *reconcile.Plan, schema newapidb.Schema, opt target.ApplyOptions) (target.Result, error)
 }
 
@@ -54,6 +54,7 @@ type Child struct {
 // Engine 是同步引擎。
 type Engine struct {
 	cfg      *config.Config
+	ignore   map[string]bool // 计算主站指纹时忽略的运行时列
 	master   MasterSource
 	workers  []*worker
 	log      *slog.Logger
@@ -63,7 +64,10 @@ type Engine struct {
 
 // New 创建引擎。
 func New(cfg *config.Config, master MasterSource, children []Child, log *slog.Logger, notifier notify.Notifier, status *Status) *Engine {
-	e := &Engine{cfg: cfg, master: master, log: log, notifier: notifier, status: status}
+	e := &Engine{cfg: cfg, master: master, log: log, notifier: notifier, status: status, ignore: map[string]bool{}}
+	for _, c := range cfg.Channels.OwnedColumns() {
+		e.ignore[c] = true
+	}
 	for _, ch := range children {
 		w := newWorker(cfg, ch, log.With("child", ch.Config.Name), notifier, status)
 		e.workers = append(e.workers, w)
@@ -97,7 +101,7 @@ func (e *Engine) Run(ctx context.Context) error {
 	for {
 		snap, checksum, err := e.loadFull(ctx, syncOptions)
 		if err == nil {
-			lastChecksum, lastFingerprint = checksum, snap.Fingerprint()
+			lastChecksum, lastFingerprint = checksum, snap.Fingerprint(e.ignore)
 			e.broadcast(snap)
 			break
 		}
@@ -129,12 +133,12 @@ func (e *Engine) Run(ctx context.Context) error {
 				e.log.Error("定期对账读取主站失败", "error", err)
 				continue
 			}
-			lastChecksum, lastFingerprint = checksum, snap.Fingerprint()
+			lastChecksum, lastFingerprint = checksum, snap.Fingerprint(e.ignore)
 			e.status.updateMaster(func(m *MasterStatus) { m.Reconciles++ })
 			e.broadcast(snap)
 
 		case <-pollT.C:
-			checksum, ok, err := e.master.Probe(ctx)
+			checksum, ok, err := e.probe(ctx)
 			now := time.Now()
 			e.status.updateMaster(func(m *MasterStatus) { m.Probes++; m.LastProbeAt = ptrTime(now) })
 			if err != nil && ok {
@@ -148,13 +152,13 @@ func (e *Engine) Run(ctx context.Context) error {
 					probeWarned = true
 				}
 				e.status.updateMaster(func(m *MasterStatus) { m.ProbeMode = "full" })
-				snap, err := e.master.Load(ctx, syncOptions)
+				snap, err := e.load(ctx, syncOptions)
 				if err != nil {
 					e.markProbeError(err)
 					continue
 				}
 				e.markMasterOK(snap, "")
-				if fp := snap.Fingerprint(); fp != lastFingerprint {
+				if fp := snap.Fingerprint(e.ignore); fp != lastFingerprint {
 					lastFingerprint = fp
 					snap.DetectedAt = now
 					e.onChange(snap)
@@ -174,10 +178,10 @@ func (e *Engine) Run(ctx context.Context) error {
 			if !sleepCtx(ctx, e.cfg.Sync.Debounce.D()) {
 				return nil
 			}
-			if latest, ok2, err2 := e.master.Probe(ctx); err2 == nil && ok2 {
+			if latest, ok2, err2 := e.probe(ctx); err2 == nil && ok2 {
 				checksum = latest
 			}
-			snap, err := e.master.Load(ctx, syncOptions)
+			snap, err := e.load(ctx, syncOptions)
 			if err != nil {
 				e.markProbeError(err)
 				continue
@@ -186,7 +190,7 @@ func (e *Engine) Run(ctx context.Context) error {
 			snap.Checksum = checksum
 			snap.DetectedAt = now
 			e.markMasterOK(snap, checksum)
-			fp := snap.Fingerprint()
+			fp := snap.Fingerprint(e.ignore)
 			if fp == lastFingerprint {
 				// 只是被忽略的运行时字段之外的无关变化（或改了又改回去），无需同步。
 				continue
@@ -206,7 +210,24 @@ func (e *Engine) onChange(snap *snapshot.Master) {
 	e.broadcast(snap)
 }
 
-func (e *Engine) loadFull(ctx context.Context, withOptions bool) (*snapshot.Master, string, error) {
+// masterTimeout 是单次读取主站的最长时间，防止主库卡住时整个循环挂起。
+const masterTimeout = 60 * time.Second
+
+func (e *Engine) probe(ctx context.Context) (string, bool, error) {
+	ctx, cancel := context.WithTimeout(ctx, masterTimeout)
+	defer cancel()
+	return e.master.Probe(ctx)
+}
+
+func (e *Engine) load(ctx context.Context, withOptions bool) (*snapshot.Master, error) {
+	ctx, cancel := context.WithTimeout(ctx, masterTimeout)
+	defer cancel()
+	return e.master.Load(ctx, withOptions)
+}
+
+func (e *Engine) loadFull(parent context.Context, withOptions bool) (*snapshot.Master, string, error) {
+	ctx, cancel := context.WithTimeout(parent, masterTimeout)
+	defer cancel()
 	if _, err := e.master.RefreshSchema(ctx); err != nil {
 		e.markProbeError(err)
 		return nil, "", err
@@ -239,7 +260,7 @@ func (e *Engine) markMasterOK(snap *snapshot.Master, checksum string) {
 		m.LastError = ""
 		m.Channels = len(snap.Channels.Rows)
 		m.Options = len(snap.Options)
-		m.Fingerprint = snap.Fingerprint()
+		m.Fingerprint = snap.Fingerprint(e.ignore)
 		if checksum != "" {
 			m.Checksum = checksum
 		}

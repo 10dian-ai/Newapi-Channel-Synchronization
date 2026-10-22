@@ -6,6 +6,7 @@ import (
 	"database/sql"
 	"encoding/hex"
 	"fmt"
+	"math"
 	"sort"
 	"strconv"
 	"strings"
@@ -186,39 +187,51 @@ func Normalize(v any) *string {
 }
 
 // DriverValue 把规范化后的值按目标列的类型转换为写入参数。
-func DriverValue(col Column, v *string) any {
+// 无法无损转换时返回错误，绝不静默截断（例如 1.5 写入整数列、超出范围的无符号数）。
+func DriverValue(col Column, v *string) (any, error) {
 	if v == nil {
-		return nil
+		return nil, nil
 	}
-	s := *v
+	s := strings.TrimSpace(*v)
 	switch col.Kind {
 	case KindInt:
-		if n, err := strconv.ParseInt(strings.TrimSpace(s), 10, 64); err == nil {
-			return n
+		if n, err := strconv.ParseInt(s, 10, 64); err == nil {
+			return n, nil
 		}
-		if f, err := strconv.ParseFloat(strings.TrimSpace(s), 64); err == nil {
-			return int64(f)
+		if n, err := strconv.ParseUint(s, 10, 64); err == nil {
+			return n, nil // bigint unsigned 的大值
+		}
+		if f, err := strconv.ParseFloat(s, 64); err == nil && f == math.Trunc(f) && math.Abs(f) < 1<<53 {
+			return int64(f), nil
 		}
 		if b, ok := parseBool(s); ok {
 			if b {
-				return int64(1)
+				return int64(1), nil
 			}
-			return int64(0)
+			return int64(0), nil
 		}
-		return s
+		return nil, fmt.Errorf("列 %s 是整数类型，无法写入值 %q", col.Name, truncateForError(*v))
 	case KindFloat:
-		if f, err := strconv.ParseFloat(strings.TrimSpace(s), 64); err == nil {
-			return f
+		if f, err := strconv.ParseFloat(s, 64); err == nil {
+			return f, nil
 		}
-		return s
+		return nil, fmt.Errorf("列 %s 是数值类型，无法写入值 %q", col.Name, truncateForError(*v))
 	case KindBool:
 		if b, ok := parseBool(s); ok {
-			return b
+			return b, nil
 		}
-		return s
+		return nil, fmt.Errorf("列 %s 是布尔类型，无法写入值 %q", col.Name, truncateForError(*v))
 	default:
-		return s
+		return *v, nil
 	}
+}
+
+// truncateForError 截断错误信息里的值，避免把长字段（可能含密钥）整段写进日志。
+func truncateForError(s string) string {
+	if len(s) > 16 {
+		return s[:8] + "…"
+	}
+	return s
 }
 
 func parseBool(s string) (bool, bool) {

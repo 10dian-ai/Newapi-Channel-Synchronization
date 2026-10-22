@@ -1,6 +1,8 @@
 package reconcile
 
 import (
+	"fmt"
+	"sort"
 	"strings"
 	"testing"
 
@@ -114,9 +116,11 @@ func TestMergeChannelInfo(t *testing.T) {
 		t.Fatalf("Key 变化后的结果不是幂等的：%s vs %s", *fresh, *again)
 	}
 
-	// mirror：原样使用主站
-	if m := MergeChannelInfo(config.StatusModeMirror, master, child, false); *m != *master {
-		t.Fatalf("mirror 应原样返回主站")
+	// mirror：Key 状态与主站完全一致，但轮询下标仍是子站自己的
+	m := MergeChannelInfo(config.StatusModeMirror, master, child, false)
+	wantMirror := `{"is_multi_key":true,"multi_key_disabled_reason":{"0":"manual","1":"auto-master"},"multi_key_mode":"polling","multi_key_polling_index":2,"multi_key_size":3,"multi_key_status_list":{"0":2,"1":3}}`
+	if *m != wantMirror {
+		t.Fatalf("mirror 结果\n got  %s\n want %s", *m, wantMirror)
 	}
 	// 主站为 NULL
 	if m := MergeChannelInfo(config.StatusModeSmart, nil, child, false); m != nil {
@@ -211,18 +215,26 @@ func TestDiffConvergesAndRespectsOwnership(t *testing.T) {
 		t.Fatalf("子站自有数据不应被覆盖：%v", p.Details())
 	}
 
-	// 主站改优先级和模型：只更新这两列，并重建能力
+	// 主站改优先级和模型：更新这两列；主站改了配置，子站之前的自动禁用判断已过时，一并恢复启用
 	master.Channels.Rows[1]["priority"] = s("20")
 	master.Channels.Rows[1]["models"] = s("gpt-4o")
 	master.Channels.Rows[1]["used_quota"] = s("123456") // 主站运行时变化不影响
 	p := Diff(master, child, cp, opt)
-	if len(p.Updates) != 1 || strings.Join(p.Updates[0].Columns(), ",") != "models,priority" {
-		t.Fatalf("应只更新 models,priority：%v", p.Details())
+	if len(p.Updates) != 1 || strings.Join(p.Updates[0].Columns(), ",") != "models,priority,status" {
+		t.Fatalf("应更新 models,priority,status：%v", p.Details())
 	}
-	if ab := p.Abilities[1]; ab == nil || ab.String("status") != "3" || ab.String("priority") != "20" {
-		t.Fatalf("能力表应按写入后的状态重建（保持子站自动禁用）：%v", ab)
+	if ab := p.Abilities[1]; ab == nil || ab.String("status") != "1" || ab.String("priority") != "20" {
+		t.Fatalf("能力表应按写入后的状态重建：%v", ab)
 	}
 	applyPlan(child, p)
+	if p := Diff(master, child, cp, opt); !p.Empty() {
+		t.Fatalf("恢复启用后应收敛：%v", p.Details())
+	}
+	// 之后子站再次自动禁用：主站没改配置，保留子站的判断
+	child.Channels.Rows[1]["status"] = s("3")
+	if p := Diff(master, child, cp, opt); !p.Empty() {
+		t.Fatalf("子站自动禁用应保留：%v", p.Details())
+	}
 
 	// 主站删除渠道 2
 	delete(master.Channels.Rows, 2)
@@ -276,6 +288,108 @@ func TestBuildAbilitiesMatchesNewAPI(t *testing.T) {
 	disabled := newapidb.BuildAbilities(1, snapshot.Row{"models": s("m"), "group": s("g"), "status": s("3")})
 	if len(disabled) != 1 || disabled[0].Enabled {
 		t.Error("禁用渠道的能力应为 enabled=false")
+	}
+}
+
+func TestMergeChannelInfoVersionSkew(t *testing.T) {
+	// 主站旧版本没有 multi_key_mode；子站新版本是 "" 并多了一个主站不认识的字段
+	master := s(`{"is_multi_key":true,"multi_key_size":2,"multi_key_status_list":{}}`)
+	child := s(`{"is_multi_key":true,"multi_key_size":2,"multi_key_mode":"","multi_key_status_list":{"1":3},"multi_key_polling_index":1,"new_field":"keep"}`)
+	got := MergeChannelInfo(config.StatusModeSmart, master, child, false)
+	if !jsonEqual(*got, *child) {
+		t.Fatalf("版本差不应改写子站的状态、下标和新字段\n got   %s\n child %s", *got, *child)
+	}
+}
+
+func TestCodexKeepsNewerChildCredential(t *testing.T) {
+	cp := BuildColumnPlan(masterCols, childCols, config.DefaultChildOwnedColumns)
+	opt := DiffOptions{StatusMode: config.StatusModeSmart}
+	mk := func(ts string) snapshot.Value {
+		return s(`{"refresh_token":"r-` + ts + `","last_refresh":"` + ts + `"}`)
+	}
+	row := func(key snapshot.Value) snapshot.Row {
+		return snapshot.Row{"id": s("7"), "type": s("57"), "key": key, "status": s("1"), "name": s("codex"),
+			"models": s("gpt-5"), "group": s("default"), "priority": s("0"), "weight": s("0"), "tag": nil,
+			"channel_info": nil, "header_override": nil}
+	}
+	master := &snapshot.Master{Channels: snapshot.Table{Columns: masterCols, Rows: map[int64]snapshot.Row{7: row(mk("2026-10-01T00:00:00Z"))}}}
+	child := &snapshot.Child{Channels: snapshot.Table{Columns: childCols, Rows: map[int64]snapshot.Row{7: row(mk("2026-10-02T00:00:00Z"))}}}
+	p := Diff(master, child, cp, opt)
+	if len(p.Updates) != 0 || len(p.Warnings) != 1 {
+		t.Fatalf("子站凭证更新时应保留并告警：%v %v", p.Details(), p.Warnings)
+	}
+	// 主站刷新得更晚：正常同步主站的
+	master.Channels.Rows[7]["key"] = mk("2026-10-03T00:00:00Z")
+	p = Diff(master, child, cp, opt)
+	if len(p.Updates) != 1 || p.Updates[0].Values.String("key") != *mk("2026-10-03T00:00:00Z") {
+		t.Fatalf("主站凭证更新时应同步：%v", p.Details())
+	}
+}
+
+func TestExcludedTypesAreLeftAlone(t *testing.T) {
+	cp := BuildColumnPlan(masterCols, childCols, config.DefaultChildOwnedColumns)
+	opt := DiffOptions{StatusMode: config.StatusModeSmart, DeleteMissing: true, DeleteGuardRatio: 1,
+		ExcludeType: func(t int64) bool { return t == 57 }}
+	master := baseMaster()
+	master.Channels.Rows[3] = snapshot.Row{"id": s("3"), "type": s("57"), "key": s("m"), "status": s("1")}
+	child := &snapshot.Child{Channels: snapshot.Table{Columns: childCols, Rows: map[int64]snapshot.Row{
+		9: {"id": s("9"), "type": s("57"), "key": s("child-own")}, // 子站自己的排除类型渠道：不删除
+	}}}
+	p := Diff(master, child, cp, opt)
+	if len(p.Inserts) != 2 || len(p.Deletes) != 0 {
+		t.Fatalf("排除类型既不新增也不删除：%v", p.Details())
+	}
+}
+
+func TestDeleteGuard(t *testing.T) {
+	cp := BuildColumnPlan(masterCols, childCols, nil)
+	master := baseMaster()
+	child := &snapshot.Child{Channels: snapshot.Table{Columns: childCols, Rows: map[int64]snapshot.Row{}}}
+	for i := int64(1); i <= 10; i++ {
+		child.Channels.Rows[i] = snapshot.Row{"id": s(fmt.Sprint(i))}
+	}
+	child.Channels.Rows[1] = master.Channels.Rows[1].Clone()
+	child.Channels.Rows[2] = master.Channels.Rows[2].Clone()
+	opt := DiffOptions{StatusMode: config.StatusModeSmart, DeleteMissing: true, DeleteGuardRatio: 0.5, DeleteGuardMin: 5}
+	p := Diff(master, child, cp, opt)
+	if len(p.Deletes) != 0 || p.DeleteBlocked != 8 {
+		t.Fatalf("一次删除 8/10 应被拦下：%+v", p.Deletes)
+	}
+	opt.DeleteGuardRatio = 1
+	if p := Diff(master, child, cp, opt); len(p.Deletes) != 8 {
+		t.Fatalf("关闭防误删后应删除：%v", p.Deletes)
+	}
+	// 少量删除不受影响
+	for i := int64(4); i <= 10; i++ {
+		delete(child.Channels.Rows, i)
+	}
+	opt.DeleteGuardRatio = 0.5
+	if p := Diff(master, child, cp, opt); len(p.Deletes) != 1 {
+		t.Fatalf("少量删除应正常执行：%v", p.Deletes)
+	}
+}
+
+func TestCheckAbilities(t *testing.T) {
+	channels := snapshot.Table{Rows: map[int64]snapshot.Row{
+		1: {"models": s("gpt-4o,GPT-4o"), "group": s("default"), "status": s("1")},
+		2: {"models": s("m"), "group": s("g"), "status": s("3")},
+	}}
+	good := []snapshot.AbilityRow{
+		{Group: "default", Model: "gpt-4o", ChannelID: 1, Enabled: true}, // 大小写冲突只存了一条
+		{Group: "g", Model: "m", ChannelID: 2, Enabled: false},
+	}
+	if bad := CheckAbilities(channels, good); len(bad) != 0 {
+		t.Fatalf("一致的能力表不应报错：%v", bad)
+	}
+	stale := []snapshot.AbilityRow{
+		{Group: "default", Model: "gpt-4o", ChannelID: 1, Enabled: true},
+		{Group: "g", Model: "m", ChannelID: 2, Enabled: true},  // 渠道已自动禁用，能力却还启用
+		{Group: "x", Model: "y", ChannelID: 99, Enabled: true}, // 渠道已不存在
+	}
+	bad := CheckAbilities(channels, stale)
+	sort.Slice(bad, func(i, j int) bool { return bad[i] < bad[j] })
+	if fmt.Sprint(bad) != "[2 99]" {
+		t.Fatalf("应发现渠道 2 与遗留的 99：%v", bad)
 	}
 }
 

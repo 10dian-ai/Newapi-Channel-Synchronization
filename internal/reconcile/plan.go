@@ -53,6 +53,10 @@ type Plan struct {
 	Options   []OptionChange
 	// OrphanOptions 是子站有、主站没有的同步范围内设置项（只记录，不删除）。
 	OrphanOptions []string
+	// AbilityRepairs 是渠道本身无需变更、但能力表与渠道不一致而需要修复的渠道。
+	AbilityRepairs []int64
+	// DeleteBlocked 是被防误删拦下的删除数量。
+	DeleteBlocked int
 	// Warnings 是需要人关注但不阻止同步的情况。
 	Warnings []string
 }
@@ -64,13 +68,17 @@ func (p *Plan) ChannelsChanged() bool {
 
 // Empty 报告是否没有任何需要写入的变更。
 func (p *Plan) Empty() bool {
-	return !p.ChannelsChanged() && len(p.Options) == 0
+	return !p.ChannelsChanged() && len(p.Options) == 0 && len(p.AbilityRepairs) == 0
 }
 
 // Summary 返回一行可读摘要，不包含任何字段值（渠道 Key 等敏感信息不会出现在日志里）。
 func (p *Plan) Summary() string {
-	return fmt.Sprintf("新增渠道 %d，更新渠道 %d，删除渠道 %d，重建能力 %d，分组设置 %d",
+	out := fmt.Sprintf("新增渠道 %d，更新渠道 %d，删除渠道 %d，重建能力 %d，分组设置 %d",
 		len(p.Inserts), len(p.Updates), len(p.Deletes), len(p.Abilities), len(p.Options))
+	if len(p.AbilityRepairs) > 0 {
+		out += fmt.Sprintf("（其中修复能力表 %d）", len(p.AbilityRepairs))
+	}
+	return out
 }
 
 // Details 返回逐项变更说明（只有列名，没有值）。
@@ -84,6 +92,9 @@ func (p *Plan) Details() []string {
 	}
 	for _, id := range p.Deletes {
 		out = append(out, fmt.Sprintf("删除渠道 #%d", id))
+	}
+	for _, id := range p.AbilityRepairs {
+		out = append(out, fmt.Sprintf("修复渠道 #%d 的能力表", id))
 	}
 	for _, o := range p.Options {
 		verb := "新增"
@@ -100,7 +111,17 @@ type DiffOptions struct {
 	StatusMode    string
 	DeleteMissing bool
 	SyncOptions   bool
+	// ExcludeType 返回 true 的渠道类型不参与同步（子站完全自己管理）。
+	ExcludeType func(t int64) bool
+	// DeleteGuardRatio / DeleteGuardMin 防误删阈值，见配置说明；DeleteGuardRatio 为 0 或 1 表示不拦截。
+	DeleteGuardRatio float64
+	DeleteGuardMin   int
+	// CheckAbilities 为 true 时校验子站能力表与渠道是否一致，不一致的渠道会被修复。
+	// 只在同步服务负责能力表（未使用子站修复接口）时开启。
+	CheckAbilities bool
 }
+
+func (o DiffOptions) excluded(t int64) bool { return o.ExcludeType != nil && o.ExcludeType(t) }
 
 // Diff 计算子站需要做的变更。
 func Diff(master *snapshot.Master, child *snapshot.Child, cp ColumnPlan, opt DiffOptions) *Plan {
@@ -108,8 +129,16 @@ func Diff(master *snapshot.Master, child *snapshot.Child, cp ColumnPlan, opt Dif
 
 	for _, id := range master.Channels.IDs() {
 		mRow := master.Channels.Rows[id]
+		if opt.excluded(mRow.Int(colType, -1)) {
+			continue
+		}
 		cRow, exists := child.Channels.Rows[id]
-		desired := desiredRow(mRow, cRow, exists, cp, opt.StatusMode)
+		if exists && opt.excluded(cRow.Int(colType, -1)) {
+			plan.Warnings = append(plan.Warnings, fmt.Sprintf("渠道 #%d 在子站上是不参与同步的类型（由子站自己管理），与主站的同 id 渠道冲突，已跳过", id))
+			continue
+		}
+		desired, warns := desiredRow(id, mRow, cRow, exists, cp, opt.StatusMode)
+		plan.Warnings = append(plan.Warnings, warns...)
 		if !exists {
 			values := desired.Clone()
 			for col, v := range cp.InsertFill {
@@ -143,19 +172,48 @@ func Diff(master *snapshot.Master, child *snapshot.Child, cp ColumnPlan, opt Dif
 
 	if opt.DeleteMissing {
 		var extra []int64
+		managed := 0
 		for _, id := range child.Channels.IDs() {
+			if opt.excluded(child.Channels.Rows[id].Int(colType, -1)) {
+				continue
+			}
+			managed++
 			if _, ok := master.Channels.Rows[id]; !ok {
 				extra = append(extra, id)
 			}
 		}
-		if len(extra) > 0 && len(master.Channels.Rows) == 0 {
+		switch {
+		case len(extra) == 0:
+		case len(master.Channels.Rows) == 0:
 			// 防误删：主站一条渠道都没有，多半是主站连错了库或刚初始化，不执行删除。
 			plan.Warnings = append(plan.Warnings, fmt.Sprintf("主站没有任何渠道，为防止误删，跳过删除子站的 %d 条渠道", len(extra)))
-		} else {
+			plan.DeleteBlocked = len(extra)
+		case opt.DeleteGuardRatio > 0 && opt.DeleteGuardRatio < 1 && len(extra) >= opt.DeleteGuardMin && float64(len(extra)) > opt.DeleteGuardRatio*float64(managed):
+			// 防误删：一次要删的太多（例如主站连到了另一个 NewAPI 库），先停下来等人确认。
+			plan.Warnings = append(plan.Warnings, fmt.Sprintf(
+				"本次需要删除子站 %d/%d 条渠道，超过防误删阈值（%.0f%%），已跳过删除。确认无误后把 sync.delete_guard_ratio 设为 1 再同步一次",
+				len(extra), managed, opt.DeleteGuardRatio*100))
+			plan.DeleteBlocked = len(extra)
+		default:
 			for _, id := range extra {
 				plan.Deletes = append(plan.Deletes, id)
 				plan.Abilities[id] = nil
 			}
+		}
+	}
+
+	if opt.CheckAbilities && child.Abilities != nil {
+		// 只修复这次没有被写入的渠道（被写入的会整体重建）
+		for _, id := range CheckAbilities(child.Channels, child.Abilities) {
+			if _, planned := plan.Abilities[id]; planned {
+				continue
+			}
+			if row, ok := child.Channels.Rows[id]; ok {
+				plan.Abilities[id] = abilitySource(row, nil)
+			} else {
+				plan.Abilities[id] = nil
+			}
+			plan.AbilityRepairs = append(plan.AbilityRepairs, id)
 		}
 	}
 
@@ -183,17 +241,37 @@ func Diff(master *snapshot.Master, child *snapshot.Child, cp ColumnPlan, opt Dif
 	return plan
 }
 
+const colType = "type"
+
 // desiredRow 计算子站某条渠道在所有同步列上的期望值。
-func desiredRow(mRow, cRow snapshot.Row, exists bool, cp ColumnPlan, statusMode string) snapshot.Row {
+func desiredRow(id int64, mRow, cRow snapshot.Row, exists bool, cp ColumnPlan, statusMode string) (snapshot.Row, []string) {
+	var warns []string
 	out := snapshot.Row{}
+	configChanged := false
 	for _, col := range cp.Synced {
-		out[col] = cp.coerce(col, mRow[col])
+		v := cp.coerce(col, mRow[col])
+		if col == newapidb.ColKey && exists && keepChildCredential(mRow, cRow) {
+			// 子站刷新过 Codex 凭证，比主站的新：保留子站的，避免用主站已经失效的旧令牌覆盖
+			v = cRow[col]
+			warns = append(warns, fmt.Sprintf("渠道 #%d（Codex）子站的凭证比主站新，已保留子站的；主站的刷新令牌可能已经失效，请在主站重新授权该渠道", id))
+		}
+		out[col] = v
+		if exists && !cp.Equal(col, cRow[col], v) {
+			configChanged = true
+		}
+	}
+	keyChanged := false
+	if exists {
+		keyChanged = !cp.Equal(newapidb.ColKey, cRow[newapidb.ColKey], out[newapidb.ColKey])
 	}
 	if cp.Status {
 		var childStatus *int64
 		if exists {
 			s := cRow.Int(newapidb.ColStatus, newapidb.StatusEnabled)
-			childStatus = &s
+			// 主站改了这个渠道的配置（比如换了 Key）：子站之前的自动禁用判断已经过时，按主站状态重来
+			if !configChanged {
+				childStatus = &s
+			}
 		}
 		d := DesiredStatus(statusMode, mRow.Int(newapidb.ColStatus, newapidb.StatusEnabled), childStatus)
 		v := fmt.Sprint(d)
@@ -201,14 +279,12 @@ func desiredRow(mRow, cRow snapshot.Row, exists bool, cp ColumnPlan, statusMode 
 	}
 	if cp.ChannelInfo {
 		var childInfo snapshot.Value
-		keyChanged := false
 		if exists {
 			childInfo = cRow[newapidb.ColChannelInfo]
-			keyChanged = !cp.Equal(newapidb.ColKey, cRow[newapidb.ColKey], mRow[newapidb.ColKey])
 		}
 		out[newapidb.ColChannelInfo] = cp.coerce(newapidb.ColChannelInfo, MergeChannelInfo(statusMode, mRow[newapidb.ColChannelInfo], childInfo, keyChanged))
 	}
-	return out
+	return out, warns
 }
 
 // abilitySource 返回写入后该渠道与能力表相关的完整行。

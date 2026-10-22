@@ -58,15 +58,44 @@ func TestKindAndValues(t *testing.T) {
 	if Normalize(nil) != nil {
 		t.Error("NULL 应为 nil")
 	}
-	one := "1"
-	if DriverValue(Column{Kind: KindBool}, &one) != true {
-		t.Error("布尔列应写入 bool")
+	dv := func(kind Kind, v string) any {
+		t.Helper()
+		out, err := DriverValue(Column{Name: "c", Kind: kind}, &v)
+		if err != nil {
+			t.Fatalf("DriverValue(%v, %q) 出错：%v", kind, v, err)
+		}
+		return out
 	}
-	if DriverValue(Column{Kind: KindInt}, &one) != int64(1) {
-		t.Error("整数列应写入 int64")
+	if dv(KindBool, "1") != true || dv(KindInt, "1") != int64(1) || dv(KindInt, "true") != int64(1) {
+		t.Error("基本类型转换不对")
 	}
-	tr := "true"
-	if DriverValue(Column{Kind: KindInt}, &tr) != int64(1) {
-		t.Error("跨库布尔写入整数列应转为 1")
+	if dv(KindInt, "18446744073709551615") != uint64(18446744073709551615) {
+		t.Error("bigint unsigned 的大值应原样写入")
+	}
+	if dv(KindInt, "10.0") != int64(10) {
+		t.Error("整数值的浮点表示应转为整数")
+	}
+	for _, c := range []struct {
+		kind Kind
+		v    string
+	}{{KindInt, "1.5"}, {KindInt, "abc"}, {KindFloat, "x"}, {KindBool, "maybe"}} {
+		v := c.v
+		if _, err := DriverValue(Column{Name: "c", Kind: c.kind}, &v); err == nil {
+			t.Errorf("%q 写入 %v 列应报错而不是截断", c.v, c.kind)
+		}
+	}
+}
+
+func TestSameDatabase(t *testing.T) {
+	same, err := SameDatabase(map[int]string{0: "uuid-a/db", 1: "h:3306/db"}, map[int]string{0: "uuid-a/db", 1: "other:3306/db"})
+	if err != nil || !same {
+		t.Error("实例 ID 相同应判定为同一个库")
+	}
+	same, err = SameDatabase(map[int]string{0: "uuid-a/db", 1: "h:3306/db"}, map[int]string{0: "uuid-b/db", 1: "h:3306/db"})
+	if err != nil || same {
+		t.Error("应以优先级最高的共同识别方式为准")
+	}
+	if _, err := SameDatabase(map[int]string{0: "a"}, map[int]string{1: "b"}); err == nil {
+		t.Error("没有共同识别方式时应报错，不能默认放行")
 	}
 }

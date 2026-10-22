@@ -66,6 +66,9 @@ func run() int {
 	}
 	log := logx.New(os.Stderr, cfg.Log.Level, cfg.Log.Format)
 	log.Info("newapi-sync", "version", version.Version, "commit", version.Commit)
+	for _, warn := range cfg.Warnings() {
+		log.Warn("配置提醒：" + warn)
+	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()

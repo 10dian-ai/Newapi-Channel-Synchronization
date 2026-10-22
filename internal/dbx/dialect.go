@@ -22,12 +22,16 @@ type Dialect interface {
 	Placeholder(n int) string
 	// ColumnsQuery 返回查询某张表列信息的 SQL 与参数。
 	ColumnsQuery(table string) (string, []any)
-	// ChecksumQuery 返回把若干列拼接后计算行校验和、再在整表聚合的查询，
+	// ChecksumQuery 返回把若干表达式拼接后计算行校验和、再在整表聚合的查询，
 	// 结果是一行一列的字符串。用于低成本地判断数据是否变化。
-	// where 可包含占位符，参数由调用方传入。
-	ChecksumQuery(table string, columns []string, where string) string
-	// IdentityQuery 返回用于识别"这是不是同一个数据库"的查询。
-	IdentityQuery() string
+	// exprs 是已经引用好的列或表达式；where 可包含占位符，参数由调用方传入。
+	ChecksumQuery(table string, exprs []string, where string) string
+	// StripJSONKeyExpr 返回去掉 JSON 中某个键之后的表达式（用于探测时忽略运行时字段）。
+	StripJSONKeyExpr(quotedCol, key string) string
+	// IdentityQueries 返回用于识别"这是不是同一个数据库"的查询，按优先级排列。
+	IdentityQueries() []string
+	// OnConflictDoNothing 返回插入时忽略主键冲突的子句（加在 VALUES 之后）。
+	OnConflictDoNothing(anyKeyCol string) string
 	// ResetSequenceSQL 返回显式插入主键后修正自增序列的 SQL；不需要时返回空串。
 	ResetSequenceSQL(table, column string) string
 }
@@ -88,11 +92,11 @@ WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = ?
 ORDER BY ORDINAL_POSITION`, []any{table}
 }
 
-func (d mysqlDialect) ChecksumQuery(table string, columns []string, where string) string {
-	parts := make([]string, len(columns))
-	for i, c := range columns {
+func (d mysqlDialect) ChecksumQuery(table string, exprs []string, where string) string {
+	parts := make([]string, len(exprs))
+	for i, e := range exprs {
 		// IFNULL 区分 NULL 与空字符串，CHAR(31) 作为不可见分隔符
-		parts[i] = "IFNULL(CAST(" + d.Quote(c) + " AS CHAR), CHAR(0))"
+		parts[i] = "IFNULL(CAST(" + e + " AS CHAR), CHAR(0))"
 	}
 	q := "SELECT CONCAT(COUNT(*), ':', COALESCE(SUM(CRC32(CONCAT_WS(CHAR(31), " + strings.Join(parts, ", ") + "))), 0)) FROM " + d.Quote(table)
 	if where != "" {
@@ -101,8 +105,20 @@ func (d mysqlDialect) ChecksumQuery(table string, columns []string, where string
 	return q
 }
 
-func (mysqlDialect) IdentityQuery() string {
-	return "SELECT CONCAT(@@server_uuid, '/', DATABASE())"
+func (mysqlDialect) StripJSONKeyExpr(col, key string) string {
+	return "IF(JSON_VALID(" + col + "), JSON_REMOVE(" + col + ", '$." + key + "'), " + col + ")"
+}
+
+func (mysqlDialect) IdentityQueries() []string {
+	return []string{
+		"SELECT CONCAT(@@server_uuid, '/', DATABASE())",
+		"SELECT CONCAT(@@hostname, ':', @@port, '/', DATABASE())",
+	}
+}
+
+func (d mysqlDialect) OnConflictDoNothing(anyKeyCol string) string {
+	q := d.Quote(anyKeyCol)
+	return " ON DUPLICATE KEY UPDATE " + q + " = " + q
 }
 
 func (mysqlDialect) ResetSequenceSQL(string, string) string { return "" }
@@ -124,10 +140,10 @@ WHERE table_schema = current_schema() AND table_name = $1
 ORDER BY ordinal_position`, []any{table}
 }
 
-func (d postgresDialect) ChecksumQuery(table string, columns []string, where string) string {
-	parts := make([]string, len(columns))
-	for i, c := range columns {
-		parts[i] = "COALESCE(" + d.Quote(c) + "::text, chr(1))"
+func (d postgresDialect) ChecksumQuery(table string, exprs []string, where string) string {
+	parts := make([]string, len(exprs))
+	for i, e := range exprs {
+		parts[i] = "COALESCE((" + e + ")::text, chr(1))"
 	}
 	inner := "SELECT md5(concat_ws(chr(31), " + strings.Join(parts, ", ") + ")) AS h FROM " + d.Quote(table)
 	if where != "" {
@@ -137,9 +153,20 @@ func (d postgresDialect) ChecksumQuery(table string, columns []string, where str
 	return "SELECT COUNT(*)::text || ':' || COALESCE(md5(string_agg(t.h, '' ORDER BY t.h)), '') FROM (" + inner + ") t"
 }
 
-func (postgresDialect) IdentityQuery() string {
-	return "SELECT current_database() || '/' || COALESCE(inet_server_addr()::text, 'local') || ':' || COALESCE(inet_server_port()::text, '') || '/' || current_setting('data_directory', true)"
+func (postgresDialect) StripJSONKeyExpr(col, key string) string {
+	// 用正则而不是 jsonb 运算：列可能是 text 类型，内容也不一定是合法 JSON
+	return "regexp_replace(" + col + "::text, '\"" + key + "\"\\s*:\\s*-?[0-9]+', '', 'g')"
 }
+
+func (postgresDialect) IdentityQueries() []string {
+	return []string{
+		// system_identifier 是集群唯一 ID，普通账号也能读取
+		"SELECT system_identifier::text || '/' || current_database() FROM pg_control_system()",
+		"SELECT COALESCE(inet_server_addr()::text, 'local') || ':' || COALESCE(inet_server_port()::text, '') || '/' || current_database()",
+	}
+}
+
+func (postgresDialect) OnConflictDoNothing(string) string { return " ON CONFLICT DO NOTHING" }
 
 func (d postgresDialect) ResetSequenceSQL(table, column string) string {
 	return fmt.Sprintf(

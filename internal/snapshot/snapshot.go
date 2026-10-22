@@ -7,6 +7,7 @@ package snapshot
 import (
 	"crypto/sha256"
 	"encoding/hex"
+	"regexp"
 	"sort"
 	"strconv"
 	"time"
@@ -88,14 +89,17 @@ type Master struct {
 	Full bool
 }
 
-// Fingerprint 返回快照内容指纹（用于日志与状态页）。
-func (m *Master) Fingerprint() string {
+// Fingerprint 返回快照内容指纹。ignore 中的列（主站自己的运行时数据）不参与计算，
+// channel_info 里的轮询下标也不参与计算。
+func (m *Master) Fingerprint(ignore map[string]bool) string {
 	h := sha256.New()
 	for _, id := range m.Channels.IDs() {
 		row := m.Channels.Rows[id]
 		cols := make([]string, 0, len(row))
 		for c := range row {
-			cols = append(cols, c)
+			if !ignore[c] {
+				cols = append(cols, c)
+			}
 		}
 		sort.Strings(cols)
 		h.Write([]byte(strconv.FormatInt(id, 10)))
@@ -104,7 +108,11 @@ func (m *Master) Fingerprint() string {
 			h.Write([]byte(c))
 			h.Write([]byte{0x1f})
 			if v := row[c]; v != nil {
-				h.Write([]byte(*v))
+				val := *v
+				if c == "channel_info" {
+					val = StripPollingIndex(val)
+				}
+				h.Write([]byte(val))
 			} else {
 				h.Write([]byte{0})
 			}
@@ -125,8 +133,28 @@ func (m *Master) Fingerprint() string {
 	return hex.EncodeToString(h.Sum(nil)[:8])
 }
 
+// StripPollingIndex 去掉 channel_info 里的多 Key 轮询下标。未开启内存缓存的 NewAPI 每次请求都会
+// 把它写回数据库，它属于运行时状态，不应被当成"主站配置有变化"。
+func StripPollingIndex(s string) string {
+	return pollingIndexPattern.ReplaceAllString(s, "")
+}
+
+var pollingIndexPattern = regexp.MustCompile(`"multi_key_polling_index"\s*:\s*-?[0-9]+`)
+
 // Child 是子站当前状态。
 type Child struct {
 	Channels Table
 	Options  map[string]string
+	// Abilities 只在需要校验能力表时读取，否则为 nil。
+	Abilities []AbilityRow
+}
+
+// AbilityRow 是子站能力表的一行（只包含用于校验的字段）。
+type AbilityRow struct {
+	Group     string
+	Model     string
+	ChannelID int64
+	Enabled   bool
+	Priority  int64
+	Weight    int64
 }

@@ -40,15 +40,26 @@ func (s *Store) Schema(ctx context.Context) (newapidb.Schema, error) {
 	return newapidb.LoadSchema(ctx, s.db, s.db.Dialect)
 }
 
-// Load 读取子站当前的渠道与同步范围内的设置。
-func (s *Store) Load(ctx context.Context, schema newapidb.Schema, withOptions bool) (*snapshot.Child, error) {
+// LoadOptions 控制读取哪些内容。
+type LoadOptions struct {
+	Options   bool // 读取同步范围内的设置
+	Abilities bool // 读取能力表（用于校验）
+}
+
+// Load 读取子站当前的渠道、同步范围内的设置，以及（可选的）能力表。
+func (s *Store) Load(ctx context.Context, schema newapidb.Schema, opt LoadOptions) (*snapshot.Child, error) {
 	channels, err := newapidb.ReadChannels(ctx, s.db, s.db.Dialect, schema.Channels)
 	if err != nil {
 		return nil, err
 	}
 	state := &snapshot.Child{Channels: channels, Options: map[string]string{}}
-	if withOptions && len(schema.Options) > 0 {
+	if opt.Options && len(schema.Options) > 0 {
 		if state.Options, err = newapidb.ReadOptions(ctx, s.db, s.db.Dialect, s.matcher); err != nil {
+			return nil, err
+		}
+	}
+	if opt.Abilities && len(schema.Abilities) > 0 {
+		if state.Abilities, err = newapidb.ReadAbilities(ctx, s.db, s.db.Dialect, schema.Abilities); err != nil {
 			return nil, err
 		}
 	}
@@ -122,7 +133,7 @@ func (s *Store) Apply(ctx context.Context, plan *reconcile.Plan, schema newapidb
 	}
 
 	if opt.RebuildAbilities && len(plan.Abilities) > 0 {
-		n, err := rebuildAbilities(ctx, tx, d, schema.Abilities, plan.Abilities)
+		n, err := rebuildAbilities(ctx, tx, d, schema, plan.Abilities)
 		if err != nil {
 			return res, fmt.Errorf("重建能力表失败：%w", err)
 		}
@@ -163,8 +174,12 @@ func insertRow(ctx context.Context, ex dbx.Execer, d dbx.Dialect, cols dbx.Colum
 		if !ok {
 			continue
 		}
+		v, err := dbx.DriverValue(col, w.Values[name])
+		if err != nil {
+			return err
+		}
 		quoted = append(quoted, d.Quote(name))
-		args = append(args, dbx.DriverValue(col, w.Values[name]))
+		args = append(args, v)
 		ph = append(ph, d.Placeholder(len(args)))
 	}
 	q := "INSERT INTO " + d.Quote(newapidb.TableChannels) + " (" + strings.Join(quoted, ", ") + ") VALUES (" + strings.Join(ph, ", ") + ")"
@@ -181,7 +196,11 @@ func updateRow(ctx context.Context, ex dbx.Execer, d dbx.Dialect, cols dbx.Colum
 		if !ok || name == newapidb.ColID {
 			continue
 		}
-		args = append(args, dbx.DriverValue(col, w.Values[name]))
+		v, err := dbx.DriverValue(col, w.Values[name])
+		if err != nil {
+			return err
+		}
+		args = append(args, v)
 		sets = append(sets, d.Quote(name)+" = "+d.Placeholder(len(args)))
 	}
 	if len(sets) == 0 {
@@ -211,64 +230,132 @@ func deleteByIDs(ctx context.Context, ex dbx.Execer, d dbx.Dialect, table, col s
 	return nil
 }
 
-// rebuildAbilities 先删除受影响渠道的全部能力记录，再按渠道写入后的状态重新生成，
-// 与 NewAPI 后台保存渠道时的做法一致；最后清理已经不存在的渠道遗留的能力记录。
-func rebuildAbilities(ctx context.Context, ex dbx.Execer, d dbx.Dialect, cols dbx.Columns, targets map[int64]snapshot.Row) (int, error) {
+// rebuildAbilities 先删除受影响渠道的全部能力记录，再按渠道"此刻"的状态重新生成，
+// 与 NewAPI 后台保存渠道时的做法一致。
+//
+// 渠道行在同一个事务里用 SELECT ... FOR UPDATE 重新读取并加锁，而不是用事务开始前读到的旧值：
+// 子站 NewAPI 可能刚好在这期间自动禁用了某个渠道，用旧值会生成 enabled=1 的能力记录，
+// 让流量继续打到已禁用的渠道上。
+func rebuildAbilities(ctx context.Context, tx *sql.Tx, d dbx.Dialect, schema newapidb.Schema, targets map[int64]snapshot.Row) (int, error) {
+	cols := schema.Abilities
 	ids := make([]int64, 0, len(targets))
-	for id := range targets {
+	var live []int64
+	for id, row := range targets {
 		ids = append(ids, id)
+		if row != nil {
+			live = append(live, id)
+		}
 	}
 	sort.Slice(ids, func(i, j int) bool { return ids[i] < ids[j] })
-	if err := deleteByIDs(ctx, ex, d, newapidb.TableAbilities, "channel_id", ids); err != nil {
+	sort.Slice(live, func(i, j int) bool { return live[i] < live[j] })
+
+	fresh, err := lockChannels(ctx, tx, d, schema.Channels, live)
+	if err != nil {
+		return 0, err
+	}
+	if err := deleteByIDs(ctx, tx, d, newapidb.TableAbilities, "channel_id", ids); err != nil {
 		return 0, err
 	}
 
 	var all []newapidb.Ability
-	for _, id := range ids {
-		if row := targets[id]; row != nil {
+	for _, id := range live {
+		if row, ok := fresh[id]; ok {
 			all = append(all, newapidb.BuildAbilities(id, row)...)
 		}
 	}
-	written := 0
-	if len(all) > 0 {
-		insertCols := make([]string, 0, 7)
-		for _, c := range []string{"group", "model", "channel_id", "enabled", "priority", "weight", "tag"} {
-			if cols.Has(c) {
-				insertCols = append(insertCols, c)
-			}
-		}
-		quoted := make([]string, len(insertCols))
-		for i, c := range insertCols {
-			quoted[i] = d.Quote(c)
-		}
-		const chunk = 100
-		for start := 0; start < len(all); start += chunk {
-			end := min(start+chunk, len(all))
-			var values []string
-			var args []any
-			for _, a := range all[start:end] {
-				ph := make([]string, len(insertCols))
-				for i, c := range insertCols {
-					col, _ := cols.Get(c)
-					args = append(args, abilityValue(col, a))
-					ph[i] = d.Placeholder(len(args))
-				}
-				values = append(values, "("+strings.Join(ph, ", ")+")")
-			}
-			q := "INSERT INTO " + d.Quote(newapidb.TableAbilities) + " (" + strings.Join(quoted, ", ") + ") VALUES " + strings.Join(values, ", ")
-			if _, err := ex.ExecContext(ctx, q, args...); err != nil {
-				return written, err
-			}
-			written += end - start
+	if len(all) == 0 {
+		return 0, nil
+	}
+	insertCols := make([]string, 0, 7)
+	for _, c := range []string{"group", "model", "channel_id", "enabled", "priority", "weight", "tag"} {
+		if cols.Has(c) {
+			insertCols = append(insertCols, c)
 		}
 	}
-
-	// 清理孤儿能力记录（渠道已不存在）
-	q := "DELETE FROM " + d.Quote(newapidb.TableAbilities) + " WHERE " + d.Quote("channel_id") + " NOT IN (SELECT " + d.Quote(newapidb.ColID) + " FROM " + d.Quote(newapidb.TableChannels) + ")"
-	if _, err := ex.ExecContext(ctx, q); err != nil {
-		return written, err
+	quoted := make([]string, len(insertCols))
+	for i, c := range insertCols {
+		quoted[i] = d.Quote(c)
+	}
+	written := 0
+	const chunk = 100
+	for start := 0; start < len(all); start += chunk {
+		end := min(start+chunk, len(all))
+		var values []string
+		var args []any
+		for _, a := range all[start:end] {
+			ph := make([]string, len(insertCols))
+			for i, c := range insertCols {
+				col, _ := cols.Get(c)
+				args = append(args, abilityValue(col, a))
+				ph[i] = d.Placeholder(len(args))
+			}
+			values = append(values, "("+strings.Join(ph, ", ")+")")
+		}
+		// 与 NewAPI 一样忽略主键冲突：在大小写不敏感的排序规则下，gpt-4o 与 GPT-4o 是同一个主键
+		q := "INSERT INTO " + d.Quote(newapidb.TableAbilities) + " (" + strings.Join(quoted, ", ") + ") VALUES " +
+			strings.Join(values, ", ") + d.OnConflictDoNothing("channel_id")
+		if _, err := tx.ExecContext(ctx, q, args...); err != nil {
+			return written, err
+		}
+		written += end - start
 	}
 	return written, nil
+}
+
+// lockChannels 在事务内重新读取并锁定指定渠道中与能力表相关的列。
+func lockChannels(ctx context.Context, tx *sql.Tx, d dbx.Dialect, chCols dbx.Columns, ids []int64) (map[int64]snapshot.Row, error) {
+	out := map[int64]snapshot.Row{}
+	if len(ids) == 0 {
+		return out, nil
+	}
+	var cols dbx.Columns
+	for _, name := range []string{newapidb.ColID, newapidb.ColModels, newapidb.ColGroup, newapidb.ColStatus, newapidb.ColPriority, newapidb.ColWeight, newapidb.ColTag} {
+		if c, ok := chCols.Get(name); ok {
+			cols = append(cols, c)
+		}
+	}
+	quoted := make([]string, len(cols))
+	for i, c := range cols {
+		quoted[i] = d.Quote(c.Name)
+	}
+	const chunk = 200
+	for start := 0; start < len(ids); start += chunk {
+		end := min(start+chunk, len(ids))
+		ph := make([]string, 0, end-start)
+		args := make([]any, 0, end-start)
+		for _, id := range ids[start:end] {
+			args = append(args, id)
+			ph = append(ph, d.Placeholder(len(args)))
+		}
+		q := "SELECT " + strings.Join(quoted, ", ") + " FROM " + d.Quote(newapidb.TableChannels) +
+			" WHERE " + d.Quote(newapidb.ColID) + " IN (" + strings.Join(ph, ", ") + ") FOR UPDATE"
+		rows, err := tx.QueryContext(ctx, q, args...)
+		if err != nil {
+			return nil, err
+		}
+		values := make([]any, len(cols))
+		ptrs := make([]any, len(cols))
+		for i := range values {
+			ptrs[i] = &values[i]
+		}
+		for rows.Next() {
+			if err := rows.Scan(ptrs...); err != nil {
+				rows.Close()
+				return nil, err
+			}
+			row := snapshot.Row{}
+			for i, c := range cols {
+				row[c.Name] = dbx.Normalize(values[i])
+			}
+			out[row.Int(newapidb.ColID, -1)] = row
+		}
+		if err := rows.Err(); err != nil {
+			rows.Close()
+			return nil, err
+		}
+		rows.Close()
+	}
+	return out, nil
 }
 
 func abilityValue(col dbx.Column, a newapidb.Ability) any {

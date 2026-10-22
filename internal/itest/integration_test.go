@@ -284,15 +284,40 @@ http: {listen: "off"}
 		t.Errorf("子站 1 应调用 fix 1 次、option 3 次，got %d / %d", fixCalls.Load(), optionCalls.Load())
 	}
 
-	// ---------- 主库只读 ----------
-	ro, err := dbx.Open(ctx, dbx.Options{Type: env.name, DSN: env.roDSN(masterDB), ReadOnly: true})
+	// ---------- 主库只读：即使给的是有写权限的账号，只读连接也必须拒绝写入 ----------
+	for _, dsn := range []string{env.roDSN(masterDB), env.adminDSN(masterDB)} {
+		ro, err := dbx.Open(ctx, dbx.Options{Type: env.name, DSN: dsn, ReadOnly: true})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := ro.Exec("UPDATE " + q("channels") + " SET " + q("name") + " = 'hacked'"); err == nil {
+			t.Fatal("主库连接应拒绝写入")
+		}
+		_ = ro.Close()
+	}
+	if n := queryString(t, m, "SELECT COUNT(*) FROM "+q("channels")+" WHERE "+q("name")+" = 'hacked'"); n != "0" {
+		t.Fatal("主库被写入了")
+	}
+
+	// ---------- 防呆：子站指向主库（换一种写法的 DSN、有写权限的账号）必须拒绝启动 ----------
+	badYAML := fmt.Sprintf(`
+master:
+  database: {type: %[1]s, dsn: %[2]q}
+children:
+  - name: oops
+    database: {type: %[1]s, dsn: %[3]q}
+http: {listen: "off"}
+`, env.name, env.roDSN(masterDB), env.adminDSN(masterDB))
+	badCfg, err := config.Parse([]byte(badYAML))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := ro.Exec("UPDATE " + q("channels") + " SET " + q("name") + " = 'hacked'"); err == nil {
-		t.Fatal("主库连接应拒绝写入")
+	if bad, err := app.Build(ctx, badCfg, log); err == nil {
+		_ = bad.Close()
+		t.Fatal("子站指向主库时必须拒绝启动")
+	} else if !strings.Contains(err.Error(), "同一个数据库") {
+		t.Fatalf("拒绝原因不对：%v", err)
 	}
-	_ = ro.Close()
 
 	// ---------- 实时同步循环 ----------
 	runCtx, cancel := context.WithCancel(ctx)
@@ -305,12 +330,15 @@ http: {listen: "off"}
 	for _, c := range []*sql.DB{c1, c2} {
 		mustExec(t, c, "UPDATE "+q("channels")+" SET "+q("status")+" = 3, "+q("used_quota")+" = 777 WHERE "+q("id")+" = 1")
 	}
-	// 主站的运行时变化：不应触发同步
+	// 主站的运行时变化（已用额度、多 Key 轮询下标）：不应触发同步
 	fixBefore := fixCalls.Load()
+	changesBefore := a.Status.Snapshot().Master.Changes
 	mustExec(t, m, "UPDATE "+q("channels")+" SET "+q("used_quota")+" = 123456 WHERE "+q("id")+" = 1")
+	mustExec(t, m, "UPDATE "+q("channels")+" SET "+q("channel_info")+" = "+ph(1)+" WHERE "+q("id")+" = 3",
+		`{"is_multi_key":true,"multi_key_size":3,"multi_key_status_list":{"0":2,"1":3},"multi_key_disabled_reason":{"0":"manual","1":"401"},"multi_key_polling_index":2,"multi_key_mode":"polling"}`)
 	time.Sleep(700 * time.Millisecond)
-	if fixCalls.Load() != fixBefore {
-		t.Errorf("主站额度变化不应触发同步")
+	if fixCalls.Load() != fixBefore || a.Status.Snapshot().Master.Changes != changesBefore {
+		t.Errorf("主站运行时变化不应触发同步")
 	}
 
 	// 主站修改：改优先级和模型、手动启用渠道 2、新增渠道 4、删除渠道 3、改分组倍率
@@ -318,13 +346,15 @@ http: {listen: "off"}
 	mustExec(t, m, "UPDATE "+q("channels")+" SET "+q("priority")+" = 20, "+q("models")+" = 'gpt-4o' WHERE "+q("id")+" = 1")
 	mustExec(t, m, "UPDATE "+q("channels")+" SET "+q("status")+" = 1 WHERE "+q("id")+" = 2")
 	insertChannel(m, cols, 4, 1, "sk-four", 1, "new", 0, "gemini", "default", 1, nil, 0, nil, nil)
+	// 只差大小写/末尾空格的模型名：在 MySQL 默认排序规则下是同一个主键，不能让整个子站同步卡住
+	insertChannel(m, cols, 5, 1, "sk-five", 1, "dup", 0, "Dup-Model,dup-model,dup-model ", "default", 0, nil, 0, nil, nil)
 	mustExec(t, m, "DELETE FROM "+q("channels")+" WHERE "+q("id")+" = 3")
 	setOption(m, "GroupRatio", `{"default":1,"vip":0.5}`)
 
 	waitFor(t, "子站跟上主站修改", func() bool {
 		for _, c := range []*sql.DB{c1, c2} {
 			ids := strings.Join(queryStrings(t, c, "SELECT "+q("id")+" FROM "+q("channels")+" ORDER BY "+q("id")), ",")
-			if ids != "1,2,4" {
+			if ids != "1,2,4,5" {
 				return false
 			}
 			if queryString(t, c, "SELECT "+q("priority")+" FROM "+q("channels")+" WHERE "+q("id")+" = 1") != "20" {
@@ -346,20 +376,37 @@ http: {listen: "off"}
 		if env.name == "mysql" {
 			row = queryStrings(t, c, "SELECT CONCAT("+q("status")+", '/', "+q("used_quota")+") FROM "+q("channels")+" WHERE "+q("id")+" = 1")
 		}
-		if len(row) != 1 || row[0] != "3/777" {
-			t.Errorf("子站自动禁用状态与已用额度应保留，got %v", row)
+		// 主站改了渠道 1 的配置：子站之前的自动禁用判断过时，恢复启用；子站自己的已用额度保留
+		if len(row) != 1 || row[0] != "1/777" {
+			t.Errorf("渠道 1 应恢复启用且保留子站已用额度，got %v", row)
 		}
-		// 渠道 1 自动禁用 → 能力 enabled=false；渠道 3 的能力被清理
 		if n := queryString(t, c, "SELECT COUNT(*) FROM "+q("abilities")+" WHERE "+q("channel_id")+" = 3"); n != "0" {
-			t.Errorf("已删除渠道的能力应清理，剩 %s", n)
+			t.Errorf("已删除渠道的能力应清理，剩 %s 条", n)
 		}
-		if n := queryString(t, c, "SELECT COUNT(*) FROM "+q("abilities")+" WHERE "+q("channel_id")+" = 1 AND "+q("enabled")+" = "+boolLit(env.name, true)); n != "0" {
-			t.Errorf("自动禁用渠道的能力应为未启用，got %s 条启用", n)
+		if n := queryString(t, c, "SELECT COUNT(*) FROM "+q("abilities")+" WHERE "+q("channel_id")+" = 1 AND "+q("enabled")+" = "+boolLit(env.name, true)); n != "2" {
+			t.Errorf("渠道 1 改为单模型后应有 2 条启用的能力（2 个分组），got %s", n)
 		}
-		if n := queryString(t, c, "SELECT COUNT(*) FROM "+q("abilities")+" WHERE "+q("channel_id")+" = 1"); n != "2" {
-			t.Errorf("渠道 1 改为单模型后应有 2 条能力（2 个分组），got %s", n)
+		if n := queryString(t, c, "SELECT COUNT(*) FROM "+q("abilities")+" WHERE "+q("channel_id")+" = 5"); n == "0" {
+			t.Errorf("大小写重复的模型也应生成能力记录")
 		}
 	}
+
+	// ---------- 能力表自愈（未使用修复接口的子站由同步服务负责能力表） ----------
+	cancel()
+	<-done
+	// 模拟：子站自动禁用了渠道 4，但能力表没跟上（仍是启用）；另有一条遗留的孤儿能力记录
+	mustExec(t, c2, "UPDATE "+q("channels")+" SET "+q("status")+" = 3 WHERE "+q("id")+" = 4")
+	mustExec(t, c2, "INSERT INTO "+q("abilities")+" ("+q("group")+","+q("model")+","+q("channel_id")+","+q("enabled")+") VALUES ('default','ghost',777,"+boolLit(env.name, true)+")")
+	if err := a.Engine.SyncOnce(ctx); err != nil {
+		t.Fatalf("修复能力表的同步失败：%v", err)
+	}
+	if v := queryString(t, c2, "SELECT "+q("status")+" FROM "+q("channels")+" WHERE "+q("id")+" = 4"); v != "3" {
+		t.Errorf("子站自己的自动禁用应保留，got %s", v)
+	}
+	if n := queryString(t, c2, "SELECT COUNT(*) FROM "+q("abilities")+" WHERE ("+q("channel_id")+" = 4 AND "+q("enabled")+" = "+boolLit(env.name, true)+") OR "+q("channel_id")+" = 777"); n != "0" {
+		t.Errorf("能力表应被修复（自动禁用渠道不应启用、遗留记录应清理），仍有 %s 条", n)
+	}
+
 	snap := a.Status.Snapshot()
 	for _, c := range snap.Children {
 		if c.State != "ok" {
@@ -371,7 +418,7 @@ http: {listen: "off"}
 	}
 }
 
-// fakeFixAbilities 模拟 NewAPI 的 FixAbility：清空能力表，按全部渠道重建。
+// fakeFixAbilities 模拟 NewAPI 的 FixAbility：清空能力表，按全部渠道重建（与 NewAPI 一样忽略主键冲突）。
 func fakeFixAbilities(t *testing.T, db *sql.DB, d dbx.Dialect) {
 	ctx := context.Background()
 	schema, err := newapidb.LoadSchema(ctx, db, d)
@@ -392,7 +439,7 @@ func fakeFixAbilities(t *testing.T, db *sql.DB, d dbx.Dialect) {
 	for _, id := range table.IDs() {
 		for _, a := range newapidb.BuildAbilities(id, table.Rows[id]) {
 			_, err := db.Exec("INSERT INTO "+q("abilities")+" ("+q("group")+","+q("model")+","+q("channel_id")+","+q("enabled")+","+q("priority")+","+q("weight")+") VALUES ("+
-				d.Placeholder(1)+","+d.Placeholder(2)+","+d.Placeholder(3)+","+d.Placeholder(4)+","+d.Placeholder(5)+","+d.Placeholder(6)+")",
+				d.Placeholder(1)+","+d.Placeholder(2)+","+d.Placeholder(3)+","+d.Placeholder(4)+","+d.Placeholder(5)+","+d.Placeholder(6)+")"+d.OnConflictDoNothing("channel_id"),
 				a.Group, a.Model, a.ChannelID, a.Enabled, a.Priority, a.Weight)
 			if err != nil {
 				t.Error(err)

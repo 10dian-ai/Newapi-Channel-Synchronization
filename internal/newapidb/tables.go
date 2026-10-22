@@ -206,3 +206,48 @@ func ReadOptions(ctx context.Context, q dbx.Queryer, d dbx.Dialect, m OptionMatc
 	}
 	return out, nil
 }
+
+// ReadAbilities 读取能力表中用于校验的字段。
+func ReadAbilities(ctx context.Context, q dbx.Queryer, d dbx.Dialect, cols dbx.Columns) ([]snapshot.AbilityRow, error) {
+	want := []string{"group", "model", "channel_id", "enabled", "priority", "weight"}
+	exprs := make([]string, len(want))
+	for i, c := range want {
+		if cols.Has(c) {
+			exprs[i] = d.Quote(c)
+		} else {
+			exprs[i] = "NULL"
+		}
+	}
+	rows, err := q.QueryContext(ctx, "SELECT "+strings.Join(exprs, ", ")+" FROM "+d.Quote(TableAbilities))
+	if err != nil {
+		return nil, fmt.Errorf("读取能力表失败：%w", err)
+	}
+	defer rows.Close()
+	out := []snapshot.AbilityRow{}
+	values := make([]any, len(want))
+	ptrs := make([]any, len(want))
+	for i := range values {
+		ptrs[i] = &values[i]
+	}
+	for rows.Next() {
+		if err := rows.Scan(ptrs...); err != nil {
+			return nil, fmt.Errorf("读取能力表失败：%w", err)
+		}
+		r := snapshot.Row{}
+		for i, c := range want {
+			r[c] = dbx.Normalize(values[i])
+		}
+		out = append(out, snapshot.AbilityRow{
+			Group:     r.String("group"),
+			Model:     r.String("model"),
+			ChannelID: r.Int("channel_id", -1),
+			Enabled:   r.Int("enabled", 0) == 1,
+			Priority:  r.Int("priority", 0),
+			Weight:    r.Int("weight", 0),
+		})
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("读取能力表失败：%w", err)
+	}
+	return out, nil
+}

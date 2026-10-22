@@ -24,7 +24,10 @@ children:
       access_token: "${CHILD1_TOKEN}"
       # 旧版本 NewAPI 需要 New-Api-User 请求头时填写令牌所属用户 ID，新版本留空
       # user_id: 1
-      # refresh_channels: fix   # fix=写库后调用子站修复接口刷新缓存（默认）；none=等子站自己刷新
+      # refresh_channels: fix   # fix=写库后调用子站修复接口刷新内存缓存（默认）
+      #                         # none=不调用。子站没开 Redis 也没设 MEMORY_CACHE_ENABLED=true 时请用 none：
+      #                         #      这种子站直接查数据库路由，写库即生效；而修复接口会先清空再重建能力表，
+      #                         #      重建的几百毫秒里这种子站会找不到渠道
       # options_via: api        # api=分组设置走子站接口，立即生效（默认）；db=直接写库
 
   - name: child2
@@ -44,16 +47,24 @@ sync:
   dry_run: false           # 全局演练模式：只计算并记录差异，不写入
   on_schema_change: continue  # 子站升级导致表结构变化时：continue=按新结构继续；pause=暂停该子站并告警
   # delete_missing: true   # 删除主站已不存在的渠道（默认 true）
+  # 防误删：一次要删除的渠道 ≥ delete_guard_min 条，且超过子站渠道数的 delete_guard_ratio 时，
+  # 跳过删除并告警（防止主站连错库把子站清空）。首次接入、确认要清掉子站旧渠道时，临时设为 1 即可。
+  # delete_guard_ratio: 0.5
+  # delete_guard_min: 5
+  # timeout: 2m            # 单个子站一次同步的最长时间
 
 # ---------------- 渠道字段归属 ----------------
 channels:
-  # smart（默认）：主站手动禁用会同步；子站自己自动禁用的渠道保持禁用，由子站自己的检测恢复
+  # smart（默认）：主站手动禁用会同步；子站自己自动禁用的渠道保持禁用（主站改了该渠道配置时恢复启用）
   # mirror：渠道状态与主站完全一致
   status_mode: smart
   # 默认由子站自己维护、不会被覆盖的字段：
   #   used_quota, balance, balance_updated_time, response_time, test_time, other_info
   # 想额外保留子站自己的某些字段时追加在这里：
   # extra_child_owned_columns: [remark]
+  # 不参与同步的渠道类型（NewAPI 渠道类型编号）：这些渠道在子站完全由子站自己管理，不增不改不删。
+  # 例如 Codex（57）想在每个子站单独授权时：
+  # exclude_types: [57]
 
 # ---------------- 分组设置 ----------------
 options:

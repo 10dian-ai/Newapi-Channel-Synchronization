@@ -120,3 +120,30 @@ func TestExampleConfigParses(t *testing.T) {
 		t.Fatalf("示例配置应能通过校验：%v", err)
 	}
 }
+
+func TestWarningsAndGuardValidation(t *testing.T) {
+	raw := `
+master: {database: {dsn: "u:p@tcp(m:3306)/db"}}
+children: [{name: c, database: {dsn: "u:p@tcp(c:3306)/db"}}]
+channels: {child_owned_columns: [remark, key]}
+`
+	cfg, err := Parse([]byte(raw))
+	if err != nil {
+		t.Fatal(err)
+	}
+	all := strings.Join(cfg.Warnings(), "\n")
+	for _, want := range []string{"used_quota", "渠道字段 key", "SYNC_FREQUENCY"} {
+		if !strings.Contains(all, want) {
+			t.Errorf("缺少提醒 %q：\n%s", want, all)
+		}
+	}
+	if cfg.Sync.GuardRatio() != 0.5 || cfg.Sync.DeleteGuardMin != 5 || cfg.Sync.Timeout.D() != 2*time.Minute {
+		t.Errorf("防误删与超时默认值不对：%+v", cfg.Sync)
+	}
+	if _, err := Parse([]byte(raw + "sync: {delete_guard_ratio: 0}\n")); err == nil {
+		t.Error("delete_guard_ratio 为 0 应报错")
+	}
+	if _, err := Parse([]byte(raw + "sync: {delete_guard_ratio: 1}\n")); err != nil {
+		t.Errorf("delete_guard_ratio 为 1（关闭）应允许：%v", err)
+	}
+}

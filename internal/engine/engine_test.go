@@ -47,7 +47,7 @@ func (f *fakeMaster) RefreshSchema(context.Context) (newapidb.Schema, error) {
 func (f *fakeMaster) Probe(context.Context) (string, bool, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	return f.snap.Fingerprint(), true, nil
+	return f.snap.Fingerprint(nil), true, nil
 }
 
 func (f *fakeMaster) Load(context.Context, bool) (*snapshot.Master, error) {
@@ -91,7 +91,7 @@ func (f *fakeStore) Schema(context.Context) (newapidb.Schema, error) {
 	return f.schema, nil
 }
 
-func (f *fakeStore) Load(context.Context, newapidb.Schema, bool) (*snapshot.Child, error) {
+func (f *fakeStore) Load(context.Context, newapidb.Schema, target.LoadOptions) (*snapshot.Child, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	cp := &snapshot.Child{Channels: snapshot.Table{Columns: chanCols, Rows: map[int64]snapshot.Row{}}, Options: map[string]string{}}
