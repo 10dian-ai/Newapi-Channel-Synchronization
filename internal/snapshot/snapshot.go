@@ -7,6 +7,7 @@ package snapshot
 import (
 	"crypto/sha256"
 	"encoding/hex"
+	"hash"
 	"regexp"
 	"sort"
 	"strconv"
@@ -79,6 +80,8 @@ type Master struct {
 	Channels Table
 	// Options 是白名单内的分组设置。
 	Options map[string]string
+	// Pricing 是模型价格相关的设置项原文（见 pricing.ReadKeys），未开启价格同步时为空。
+	Pricing map[string]string
 	// Checksum 是探测得到的校验和（可能为空）。
 	Checksum string
 	// DetectedAt 是发现这次变更的时间，用来计算端到端同步延迟。
@@ -119,18 +122,24 @@ func (m *Master) Fingerprint(ignore map[string]bool) string {
 		}
 		h.Write([]byte{0x1d})
 	}
-	keys := make([]string, 0, len(m.Options))
-	for k := range m.Options {
+	writeKV(h, m.Options)
+	h.Write([]byte{0x1c})
+	writeKV(h, m.Pricing)
+	return hex.EncodeToString(h.Sum(nil)[:8])
+}
+
+func writeKV(h hash.Hash, kv map[string]string) {
+	keys := make([]string, 0, len(kv))
+	for k := range kv {
 		keys = append(keys, k)
 	}
 	sort.Strings(keys)
 	for _, k := range keys {
 		h.Write([]byte(k))
 		h.Write([]byte{0x1f})
-		h.Write([]byte(m.Options[k]))
+		h.Write([]byte(kv[k]))
 		h.Write([]byte{0x1d})
 	}
-	return hex.EncodeToString(h.Sum(nil)[:8])
 }
 
 // StripPollingIndex 去掉 channel_info 里的多 Key 轮询下标。未开启内存缓存的 NewAPI 每次请求都会
@@ -145,6 +154,8 @@ var pollingIndexPattern = regexp.MustCompile(`"multi_key_polling_index"\s*:\s*-?
 type Child struct {
 	Channels Table
 	Options  map[string]string
+	// Pricing 是模型价格相关的设置项原文，只在开启价格同步时读取。
+	Pricing map[string]string
 	// Abilities 只在需要校验能力表时读取，否则为 nil。
 	Abilities []AbilityRow
 }

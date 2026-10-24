@@ -2,7 +2,7 @@
 //
 //   - GET  /api/status          读取版本号（公开接口）
 //   - POST /api/channel/fix     让子站按自身版本逻辑重建能力表并刷新渠道内存缓存（需要 channel:operate）
-//   - PUT  /api/option/         写入一项设置，子站会校验并立即更新内存（需要 option:write）
+//   - PUT  /api/option/         写入一项设置（分组设置、模型价格），子站会校验并立即更新内存（需要 option:write）
 package newapi
 
 import (

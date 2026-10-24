@@ -6,6 +6,7 @@ import (
 	"strings"
 
 	"github.com/10dian-ai/newapi-channel-synchronization/internal/newapidb"
+	"github.com/10dian-ai/newapi-channel-synchronization/internal/pricing"
 	"github.com/10dian-ai/newapi-channel-synchronization/internal/snapshot"
 )
 
@@ -53,6 +54,8 @@ type Plan struct {
 	Options   []OptionChange
 	// OrphanOptions 是子站有、主站没有的同步范围内设置项（只记录，不删除）。
 	OrphanOptions []string
+	// Pricing 是模型价格的变更（规则见 pricing 包）。
+	Pricing pricing.Plan
 	// AbilityRepairs 是渠道本身无需变更、但能力表与渠道不一致而需要修复的渠道。
 	AbilityRepairs []int64
 	// DeleteBlocked 是被防误删拦下的删除数量。
@@ -68,13 +71,13 @@ func (p *Plan) ChannelsChanged() bool {
 
 // Empty 报告是否没有任何需要写入的变更。
 func (p *Plan) Empty() bool {
-	return !p.ChannelsChanged() && len(p.Options) == 0 && len(p.AbilityRepairs) == 0
+	return !p.ChannelsChanged() && len(p.Options) == 0 && len(p.AbilityRepairs) == 0 && p.Pricing.Empty()
 }
 
 // Summary 返回一行可读摘要，不包含任何字段值（渠道 Key 等敏感信息不会出现在日志里）。
 func (p *Plan) Summary() string {
-	out := fmt.Sprintf("新增渠道 %d，更新渠道 %d，删除渠道 %d，重建能力 %d，分组设置 %d",
-		len(p.Inserts), len(p.Updates), len(p.Deletes), len(p.Abilities), len(p.Options))
+	out := fmt.Sprintf("新增渠道 %d，更新渠道 %d，删除渠道 %d，重建能力 %d，分组设置 %d，模型价格 %d",
+		len(p.Inserts), len(p.Updates), len(p.Deletes), len(p.Abilities), len(p.Options), len(p.Pricing.Changes))
 	if len(p.AbilityRepairs) > 0 {
 		out += fmt.Sprintf("（其中修复能力表 %d）", len(p.AbilityRepairs))
 	}
@@ -103,7 +106,7 @@ func (p *Plan) Details() []string {
 		}
 		out = append(out, fmt.Sprintf("%s设置 %s", verb, o.Key))
 	}
-	return out
+	return append(out, p.Pricing.Details()...)
 }
 
 // DiffOptions 控制差异计算。
@@ -111,6 +114,8 @@ type DiffOptions struct {
 	StatusMode    string
 	DeleteMissing bool
 	SyncOptions   bool
+	// SyncPricing 为 true 时让子站模型价格与主站完全一致。
+	SyncPricing bool
 	// ExcludeType 返回 true 的渠道类型不参与同步（子站完全自己管理）。
 	ExcludeType func(t int64) bool
 	// DeleteGuardRatio / DeleteGuardMin 防误删阈值，见配置说明；DeleteGuardRatio 为 0 或 1 表示不拦截。
@@ -237,6 +242,11 @@ func Diff(master *snapshot.Master, child *snapshot.Child, cp ColumnPlan, opt Dif
 			}
 		}
 		sort.Strings(plan.OrphanOptions)
+	}
+
+	if opt.SyncPricing {
+		plan.Pricing = pricing.Diff(master.Pricing, child.Pricing)
+		plan.Warnings = append(plan.Warnings, plan.Pricing.Warnings...)
 	}
 	return plan
 }

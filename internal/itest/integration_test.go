@@ -33,6 +33,7 @@ import (
 	"github.com/10dian-ai/newapi-channel-synchronization/internal/config"
 	"github.com/10dian-ai/newapi-channel-synchronization/internal/dbx"
 	"github.com/10dian-ai/newapi-channel-synchronization/internal/newapidb"
+	"github.com/10dian-ai/newapi-channel-synchronization/internal/pricing"
 )
 
 type dialectEnv struct {
@@ -161,15 +162,38 @@ func runSuite(t *testing.T, env dialectEnv, driver string) {
 	insertChannel(m, cols, 1, 1, "sk-one", 1, "openai", 0, "gpt-4o,gpt-4o-mini", "default,vip", 10, nil, 100, `{"is_multi_key":false,"multi_key_size":0,"multi_key_status_list":null,"multi_key_polling_index":0,"multi_key_mode":""}`, `{"X-A":"1"}`)
 	insertChannel(m, cols, 2, 14, "sk-two", 2, "claude", 5, "claude-sonnet", "default", 0, "team", 7, nil, nil)
 	insertChannel(m, cols, 3, 1, "k1\nk2\nk3", 1, "multi", 3, "o3", "vip", 5, nil, 0, `{"is_multi_key":true,"multi_key_size":3,"multi_key_status_list":{"0":2,"1":3},"multi_key_disabled_reason":{"0":"manual","1":"401"},"multi_key_polling_index":1,"multi_key_mode":"polling"}`, nil)
+	// setOption 在一个事务里删除再插入，其他连接不会读到"这一项暂时不存在"的中间状态
 	setOption := func(db *sql.DB, k, v string) {
 		t.Helper()
-		mustExec(t, db, "DELETE FROM "+q("options")+" WHERE "+q("key")+" = "+ph(1), k)
-		mustExec(t, db, "INSERT INTO "+q("options")+" ("+q("key")+","+q("value")+") VALUES ("+ph(1)+","+ph(2)+")", k, v)
+		tx, err := db.Begin()
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer func() { _ = tx.Rollback() }()
+		if _, err := tx.Exec("DELETE FROM "+q("options")+" WHERE "+q("key")+" = "+ph(1), k); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := tx.Exec("INSERT INTO "+q("options")+" ("+q("key")+","+q("value")+") VALUES ("+ph(1)+","+ph(2)+")", k, v); err != nil {
+			t.Fatal(err)
+		}
+		if err := tx.Commit(); err != nil {
+			t.Fatal(err)
+		}
 	}
 	setOption(m, "GroupRatio", `{"default":1,"vip":0.8}`)
 	setOption(m, "UserUsableGroups", `{"default":"默认分组","vip":"VIP"}`)
 	setOption(m, "group_ratio_setting.group_special_usable_group", `{"vip":{"+:svip":"超级"}}`)
 	setOption(m, "SystemName", "主站名称") // 不在同步范围内
+	// 主站模型价格：原文带缩进；一个模型按表达式计费，其他还是旧倍率
+	masterPrices := map[string]string{
+		"ModelRatio":                   "{\n  \"gpt-4o\": 1.25,\n  \"o3\": 5\n}",
+		"CompletionRatio":              `{"gpt-4o": 4}`,
+		"billing_setting.billing_mode": `{"gpt-6-astra": "tiered_expr"}`,
+		"billing_setting.billing_expr": `{"gpt-6-astra": "len <= 272000 ? tier(\"standard\", p * 10 + c * 50) : tier(\"long_context\", p * 20 + c * 75)"}`,
+	}
+	for k, v := range masterPrices {
+		setOption(m, k, v)
+	}
 
 	// 子站：一条主站没有的旧渠道（应被删除），以及子站自己的站点名称（应保留）
 	childCols := []string{"id", "type", "key", "status", "name", "models", "group", "routing_hint"}
@@ -177,10 +201,13 @@ func runSuite(t *testing.T, env dialectEnv, driver string) {
 		insertChannel(c, childCols, 99, 1, "old", 1, "stale", "m", "default", "x")
 		mustExec(t, c, "INSERT INTO "+q("abilities")+" ("+q("group")+","+q("model")+","+q("channel_id")+","+q("enabled")+") VALUES ('default','m',99,"+boolLit(env.name, true)+")")
 		setOption(c, "SystemName", "子站名称")
+		// 子站自己的旧价格：child-only 应被删除；ModelPrice 主站库里没有，保持不动
+		setOption(c, "ModelRatio", `{"gpt-4o":9,"child-only":1}`)
+		setOption(c, "ModelPrice", `{"mj":0.1}`)
 	}
 
 	// 模拟子站 1 的 NewAPI 管理接口：fix 按 NewAPI 规则重建全部能力，option 写库
-	var fixCalls, optionCalls atomic.Int32
+	var fixCalls, optionCalls, pricingCalls atomic.Int32
 	var apiMu sync.Mutex
 	fake := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		apiMu.Lock()
@@ -198,10 +225,23 @@ func runSuite(t *testing.T, env dialectEnv, driver string) {
 			fakeFixAbilities(t, c1, d)
 			_, _ = w.Write([]byte(`{"success":true,"data":{"success":1,"fails":0}}`))
 		case "PUT /api/option/":
-			optionCalls.Add(1)
 			var body map[string]string
 			_ = json.NewDecoder(r.Body).Decode(&body)
-			setOption(c1, body["key"], body["value"])
+			value := body["value"]
+			if pricing.IsKey(body["key"]) {
+				// 新版 NewAPI 会把价格重新编码后再存库，原文与主站不同
+				pricingCalls.Add(1)
+				var obj map[string]any
+				if err := json.Unmarshal([]byte(value), &obj); err != nil {
+					w.WriteHeader(http.StatusBadRequest)
+					return
+				}
+				b, _ := json.Marshal(obj)
+				value = string(b)
+			} else {
+				optionCalls.Add(1)
+			}
+			setOption(c1, body["key"], value)
 			_, _ = w.Write([]byte(`{"success":true}`))
 		default:
 			w.WriteHeader(http.StatusNotFound)
@@ -279,9 +319,24 @@ http: {listen: "off"}
 		if v := queryString(t, c, "SELECT "+q("value")+" FROM "+q("options")+" WHERE "+q("key")+" = 'SystemName'"); v != "子站名称" {
 			t.Errorf("同步范围外的设置不应被改动：%q", v)
 		}
+		for k, want := range masterPrices {
+			if got := queryString(t, c, "SELECT "+q("value")+" FROM "+q("options")+" WHERE "+q("key")+" = '"+k+"'"); !pricing.Equal(got, want) {
+				t.Errorf("模型价格 %s 未同步：%q", k, got)
+			}
+		}
+		if v := queryString(t, c, "SELECT "+q("value")+" FROM "+q("options")+" WHERE "+q("key")+" = 'ModelPrice'"); v != `{"mj":0.1}` {
+			t.Errorf("主站库里没有的价格设置项应保持子站原样：%q", v)
+		}
 	}
-	if fixCalls.Load() != 1 || optionCalls.Load() != 3 {
-		t.Errorf("子站 1 应调用 fix 1 次、option 3 次，got %d / %d", fixCalls.Load(), optionCalls.Load())
+	if fixCalls.Load() != 1 || optionCalls.Load() != 3 || pricingCalls.Load() != 4 {
+		t.Errorf("子站 1 应调用 fix 1 次、分组设置 3 次、模型价格 4 次，got %d / %d / %d", fixCalls.Load(), optionCalls.Load(), pricingCalls.Load())
+	}
+	// 子站把价格重新编码后存库，再同步一次不应判定有差异
+	if err := a.Engine.SyncOnce(ctx); err != nil {
+		t.Fatalf("第二次同步失败：%v", err)
+	}
+	if pricingCalls.Load() != 4 {
+		t.Errorf("价格已一致，不应重复写入，got %d 次", pricingCalls.Load())
 	}
 
 	// ---------- 主库只读：即使给的是有写权限的账号，只读连接也必须拒绝写入 ----------
@@ -350,9 +405,13 @@ http: {listen: "off"}
 	insertChannel(m, cols, 5, 1, "sk-five", 1, "dup", 0, "Dup-Model,dup-model,dup-model ", "default", 0, nil, 0, nil, nil)
 	mustExec(t, m, "DELETE FROM "+q("channels")+" WHERE "+q("id")+" = 3")
 	setOption(m, "GroupRatio", `{"default":1,"vip":0.5}`)
+	setOption(m, "ModelRatio", "{\n  \"gpt-4o\": 1.25,\n  \"o3\": 6\n}")
 
 	waitFor(t, "子站跟上主站修改", func() bool {
 		for _, c := range []*sql.DB{c1, c2} {
+			if !pricing.Equal(queryString(t, c, "SELECT "+q("value")+" FROM "+q("options")+" WHERE "+q("key")+" = 'ModelRatio'"), `{"gpt-4o":1.25,"o3":6}`) {
+				return false
+			}
 			ids := strings.Join(queryStrings(t, c, "SELECT "+q("id")+" FROM "+q("channels")+" ORDER BY "+q("id")), ",")
 			if ids != "1,2,4,5" {
 				return false
@@ -414,6 +473,9 @@ http: {listen: "off"}
 		}
 		if len(c.MissingInChild) != 1 || c.MissingInChild[0] != "header_override" {
 			t.Errorf("子站 %s 应识别出缺少 header_override 列：%v", c.Name, c.MissingInChild)
+		}
+		if len(c.PricingNotInMaster) != 1 || c.PricingNotInMaster[0] != "ModelPrice" {
+			t.Errorf("子站 %s 应列出主站库里没有的 ModelPrice：%v", c.Name, c.PricingNotInMaster)
 		}
 	}
 }

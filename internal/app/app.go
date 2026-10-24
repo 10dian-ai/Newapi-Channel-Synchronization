@@ -14,6 +14,7 @@ import (
 	"github.com/10dian-ai/newapi-channel-synchronization/internal/newapi"
 	"github.com/10dian-ai/newapi-channel-synchronization/internal/newapidb"
 	"github.com/10dian-ai/newapi-channel-synchronization/internal/notify"
+	"github.com/10dian-ai/newapi-channel-synchronization/internal/pricing"
 	"github.com/10dian-ai/newapi-channel-synchronization/internal/source"
 	"github.com/10dian-ai/newapi-channel-synchronization/internal/target"
 )
@@ -48,6 +49,10 @@ func Build(ctx context.Context, cfg *config.Config, log *slog.Logger) (*App, err
 	if cfg.Options.IsEnabled() {
 		matcher = newapidb.OptionMatcher{Keys: cfg.Options.Keys, Prefixes: cfg.Options.KeyPrefixes}
 	}
+	pricingMatcher := newapidb.OptionMatcher{}
+	if cfg.Pricing.IsEnabled() {
+		pricingMatcher = newapidb.OptionMatcher{Keys: pricing.ReadKeys()}
+	}
 
 	masterDB, err := dbx.Open(ctx, dbx.Options{
 		Type:         cfg.Master.Database.Type,
@@ -65,7 +70,7 @@ func Build(ctx context.Context, cfg *config.Config, log *slog.Logger) (*App, err
 	}
 	log.Info("已连接主站（只读）", "type", masterDB.Dialect.Name())
 
-	master, err := source.New(masterDB, matcher, cfg.Channels.OwnedColumns())
+	master, err := source.New(masterDB, matcher, pricingMatcher, cfg.Channels.OwnedColumns())
 	if err != nil {
 		return nil, err
 	}
@@ -98,7 +103,7 @@ func Build(ctx context.Context, cfg *config.Config, log *slog.Logger) (*App, err
 				return nil, fmt.Errorf("子站 %s：%w", ch.Name, target.ErrSameDatabase)
 			}
 		}
-		store := target.New(db, matcher)
+		store := target.New(db, matcher, pricingMatcher)
 		if _, err := store.Schema(ctx); err != nil {
 			return nil, fmt.Errorf("子站 %s：%w", ch.Name, err)
 		}

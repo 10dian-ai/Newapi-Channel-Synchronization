@@ -24,6 +24,7 @@ type MasterStatus struct {
 	Fingerprint   string     `json:"fingerprint,omitempty"`
 	Channels      int        `json:"channels"`
 	Options       int        `json:"options"`
+	Pricing       int        `json:"pricing"`
 	LastProbeAt   *time.Time `json:"last_probe_at,omitempty"`
 	LastOKAt      *time.Time `json:"last_ok_at,omitempty"`
 	LastChangeAt  *time.Time `json:"last_change_at,omitempty"`
@@ -45,6 +46,7 @@ type ChildStatus struct {
 	SchemaFingerprint   string     `json:"schema_fingerprint,omitempty"`
 	MissingInChild      []string   `json:"missing_in_child,omitempty"`
 	ChildOnlyColumns    []string   `json:"child_only_columns,omitempty"`
+	PricingNotInMaster  []string   `json:"pricing_not_in_master,omitempty"`
 	Channels            int        `json:"channels"`
 	LastAttemptAt       *time.Time `json:"last_attempt_at,omitempty"`
 	LastSuccessAt       *time.Time `json:"last_success_at,omitempty"`
@@ -61,6 +63,7 @@ type ChildStatus struct {
 	Updated             int64      `json:"updated"`
 	Deleted             int64      `json:"deleted"`
 	OptionWrites        int64      `json:"option_writes"`
+	PricingWrites       int64      `json:"pricing_writes"`
 }
 
 // Status 是线程安全的状态登记处，供状态接口与指标使用。
@@ -115,6 +118,7 @@ func (s *Status) Snapshot() Snapshot {
 		cp.LastWarnings = append([]string(nil), c.LastWarnings...)
 		cp.MissingInChild = append([]string(nil), c.MissingInChild...)
 		cp.ChildOnlyColumns = append([]string(nil), c.ChildOnlyColumns...)
+		cp.PricingNotInMaster = append([]string(nil), c.PricingNotInMaster...)
 		out.Children = append(out.Children, cp)
 	}
 	sort.Slice(out.Children, func(i, j int) bool { return out.Children[i].Name < out.Children[j].Name })

@@ -48,6 +48,9 @@ func TestParseMinimalWithDefaults(t *testing.T) {
 	if len(cfg.Options.Keys) == 0 || cfg.Options.KeyPrefixes[0] != "group_ratio_setting." {
 		t.Errorf("默认分组设置范围不对：%+v", cfg.Options)
 	}
+	if !cfg.Pricing.IsEnabled() {
+		t.Errorf("默认应同步模型价格")
+	}
 	if got := strings.Join(cfg.Channels.OwnedColumns(), ","); !strings.Contains(got, "used_quota") {
 		t.Errorf("默认子站自有列：%s", got)
 	}
@@ -96,6 +99,18 @@ children: [{name: c, database: {type: sqlite, dsn: "/data/one-api.db"}}]`,
 master: {database: {dsn: "u:p@tcp(m:3306)/db"}}
 children: [{name: c, database: {dsn: "u:p@tcp(c:3306)/db"}}]
 options: {key_prefixes: [""]}`,
+		"价格放进 options": `
+master: {database: {dsn: "u:p@tcp(m:3306)/db"}}
+children: [{name: c, database: {dsn: "u:p@tcp(c:3306)/db"}}]
+options: {keys: [GroupRatio, ModelRatio]}`,
+		"前缀覆盖价格": `
+master: {database: {dsn: "u:p@tcp(m:3306)/db"}}
+children: [{name: c, database: {dsn: "u:p@tcp(c:3306)/db"}}]
+options: {key_prefixes: ["billing_setting."]}`,
+		"同步 QuotaPerUnit": `
+master: {database: {dsn: "u:p@tcp(m:3306)/db"}}
+children: [{name: c, database: {dsn: "u:p@tcp(c:3306)/db"}}]
+options: {keys: [GroupRatio, QuotaPerUnit]}`,
 	}
 	for name, raw := range cases {
 		if _, err := Parse([]byte(raw)); err == nil {

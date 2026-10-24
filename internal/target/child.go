@@ -24,12 +24,13 @@ var knownAbilityColumns = map[string]bool{
 // Store 是一个子站数据库。
 type Store struct {
 	db      *dbx.DB
-	matcher newapidb.OptionMatcher
+	matcher newapidb.OptionMatcher // 分组设置的范围
+	pricing newapidb.OptionMatcher // 模型价格设置项的范围，为空表示不同步价格
 }
 
 // New 创建子站存储。
-func New(db *dbx.DB, matcher newapidb.OptionMatcher) *Store {
-	return &Store{db: db, matcher: matcher}
+func New(db *dbx.DB, matcher, pricing newapidb.OptionMatcher) *Store {
+	return &Store{db: db, matcher: matcher, pricing: pricing}
 }
 
 // DB 返回底层连接（用于身份检查）。
@@ -43,19 +44,25 @@ func (s *Store) Schema(ctx context.Context) (newapidb.Schema, error) {
 // LoadOptions 控制读取哪些内容。
 type LoadOptions struct {
 	Options   bool // 读取同步范围内的设置
+	Pricing   bool // 读取模型价格设置项
 	Abilities bool // 读取能力表（用于校验）
 }
 
-// Load 读取子站当前的渠道、同步范围内的设置，以及（可选的）能力表。
+// Load 读取子站当前的渠道、同步范围内的设置、模型价格，以及（可选的）能力表。
 func (s *Store) Load(ctx context.Context, schema newapidb.Schema, opt LoadOptions) (*snapshot.Child, error) {
 	channels, err := newapidb.ReadChannels(ctx, s.db, s.db.Dialect, schema.Channels)
 	if err != nil {
 		return nil, err
 	}
-	state := &snapshot.Child{Channels: channels, Options: map[string]string{}}
+	state := &snapshot.Child{Channels: channels, Options: map[string]string{}, Pricing: map[string]string{}}
 	if opt.Options && len(schema.Options) > 0 {
 		if state.Options, err = newapidb.ReadOptions(ctx, s.db, s.db.Dialect, s.matcher); err != nil {
 			return nil, err
+		}
+	}
+	if opt.Pricing && len(schema.Options) > 0 && !s.pricing.Empty() {
+		if state.Pricing, err = newapidb.ReadOptions(ctx, s.db, s.db.Dialect, s.pricing); err != nil {
+			return nil, fmt.Errorf("读取模型价格失败：%w", err)
 		}
 	}
 	if opt.Abilities && len(schema.Abilities) > 0 {
@@ -89,16 +96,16 @@ func AbilitiesWritable(cols dbx.Columns) (bool, string) {
 type ApplyOptions struct {
 	// RebuildAbilities 是否在同一事务里重建受影响渠道的能力记录。
 	RebuildAbilities bool
-	// WriteOptions 是否在同一事务里写入分组设置（options_via=db 时）。
+	// WriteOptions 是否在同一事务里写入分组设置与模型价格（options_via=db 时）。
 	WriteOptions bool
 }
 
 // Result 是一次写入的结果。
 type Result struct {
-	Inserted, Updated, Deleted, AbilityRows, Options int
+	Inserted, Updated, Deleted, AbilityRows, Options, Pricing int
 }
 
-// Apply 在一个事务中写入渠道、能力表和（可选的）分组设置。任一步失败都会整体回滚。
+// Apply 在一个事务中写入渠道、能力表和（可选的）分组设置与模型价格。任一步失败都会整体回滚。
 func (s *Store) Apply(ctx context.Context, plan *reconcile.Plan, schema newapidb.Schema, opt ApplyOptions) (Result, error) {
 	var res Result
 	tx, err := s.db.BeginTx(ctx, nil)
@@ -140,12 +147,19 @@ func (s *Store) Apply(ctx context.Context, plan *reconcile.Plan, schema newapidb
 		res.AbilityRows = n
 	}
 
-	if opt.WriteOptions && len(plan.Options) > 0 {
+	if opt.WriteOptions {
 		for _, o := range plan.Options {
-			if err := upsertOption(ctx, tx, d, o); err != nil {
+			if err := upsertOption(ctx, tx, d, o.Key, o.Value); err != nil {
 				return res, fmt.Errorf("写入设置 %s 失败：%w", o.Key, err)
 			}
 			res.Options++
+		}
+		// 同一个事务里一次写完，子站不会看到写了一半的价格，所以不需要逐项写入时的特殊顺序
+		for _, c := range plan.Pricing.Changes {
+			if err := upsertOption(ctx, tx, d, c.Key, c.Value); err != nil {
+				return res, fmt.Errorf("写入模型价格 %s 失败：%w", c.Key, err)
+			}
+			res.Pricing++
 		}
 	}
 
@@ -387,17 +401,17 @@ func abilityValue(col dbx.Column, a newapidb.Ability) any {
 	return nil
 }
 
-func upsertOption(ctx context.Context, tx *sql.Tx, d dbx.Dialect, o reconcile.OptionChange) error {
+func upsertOption(ctx context.Context, tx *sql.Tx, d dbx.Dialect, key, value string) error {
 	keyCol, valCol, table := d.Quote(newapidb.OptionKeyCol), d.Quote(newapidb.OptionValueCol), d.Quote(newapidb.TableOptions)
 	var count int64
-	if err := tx.QueryRowContext(ctx, "SELECT COUNT(*) FROM "+table+" WHERE "+keyCol+" = "+d.Placeholder(1), o.Key).Scan(&count); err != nil {
+	if err := tx.QueryRowContext(ctx, "SELECT COUNT(*) FROM "+table+" WHERE "+keyCol+" = "+d.Placeholder(1), key).Scan(&count); err != nil {
 		return err
 	}
 	if count > 0 {
-		_, err := tx.ExecContext(ctx, "UPDATE "+table+" SET "+valCol+" = "+d.Placeholder(1)+" WHERE "+keyCol+" = "+d.Placeholder(2), o.Value, o.Key)
+		_, err := tx.ExecContext(ctx, "UPDATE "+table+" SET "+valCol+" = "+d.Placeholder(1)+" WHERE "+keyCol+" = "+d.Placeholder(2), value, key)
 		return err
 	}
-	_, err := tx.ExecContext(ctx, "INSERT INTO "+table+" ("+keyCol+", "+valCol+") VALUES ("+d.Placeholder(1)+", "+d.Placeholder(2)+")", o.Key, o.Value)
+	_, err := tx.ExecContext(ctx, "INSERT INTO "+table+" ("+keyCol+", "+valCol+") VALUES ("+d.Placeholder(1)+", "+d.Placeholder(2)+")", key, value)
 	return err
 }
 

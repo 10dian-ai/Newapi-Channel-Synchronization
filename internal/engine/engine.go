@@ -18,6 +18,7 @@ import (
 	"github.com/10dian-ai/newapi-channel-synchronization/internal/config"
 	"github.com/10dian-ai/newapi-channel-synchronization/internal/newapidb"
 	"github.com/10dian-ai/newapi-channel-synchronization/internal/notify"
+	"github.com/10dian-ai/newapi-channel-synchronization/internal/pricing"
 	"github.com/10dian-ai/newapi-channel-synchronization/internal/reconcile"
 	"github.com/10dian-ai/newapi-channel-synchronization/internal/snapshot"
 	"github.com/10dian-ai/newapi-channel-synchronization/internal/target"
@@ -93,7 +94,8 @@ func (e *Engine) Run(ctx context.Context) error {
 		"children", len(e.workers),
 		"poll_interval", poll,
 		"reconcile_interval", e.cfg.Sync.ReconcileInterval.D(),
-		"status_mode", e.cfg.Channels.StatusMode)
+		"status_mode", e.cfg.Channels.StatusMode,
+		"sync_pricing", e.cfg.Pricing.IsEnabled())
 
 	// 首次全量：失败就退避重试，直到成功或退出。
 	backoff := newBackoff(e.cfg.Sync.RetryMin.D(), e.cfg.Sync.RetryMax.D())
@@ -206,7 +208,7 @@ func (e *Engine) onChange(snap *snapshot.Master) {
 		m.Changes++
 		m.LastChangeAt = ptrTime(snap.DetectedAt)
 	})
-	e.log.Info("主站渠道/分组有变化，开始同步", "channels", len(snap.Channels.Rows), "options", len(snap.Options))
+	e.log.Info("主站渠道/分组/模型价格有变化，开始同步", "channels", len(snap.Channels.Rows), "options", len(snap.Options), "pricing", pricingKeys(snap))
 	e.broadcast(snap)
 }
 
@@ -260,11 +262,23 @@ func (e *Engine) markMasterOK(snap *snapshot.Master, checksum string) {
 		m.LastError = ""
 		m.Channels = len(snap.Channels.Rows)
 		m.Options = len(snap.Options)
+		m.Pricing = pricingKeys(snap)
 		m.Fingerprint = snap.Fingerprint(e.ignore)
 		if checksum != "" {
 			m.Checksum = checksum
 		}
 	})
+}
+
+// pricingKeys 返回主站库里有的模型价格设置项数量（不含只用于检查的 QuotaPerUnit）。
+func pricingKeys(snap *snapshot.Master) int {
+	n := 0
+	for k := range snap.Pricing {
+		if pricing.IsKey(k) {
+			n++
+		}
+	}
+	return n
 }
 
 func (e *Engine) markProbeError(err error) {

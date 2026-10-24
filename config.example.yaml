@@ -28,14 +28,14 @@ children:
       #                         # none=不调用。子站没开 Redis 也没设 MEMORY_CACHE_ENABLED=true 时请用 none：
       #                         #      这种子站直接查数据库路由，写库即生效；而修复接口会先清空再重建能力表，
       #                         #      重建的几百毫秒里这种子站会找不到渠道
-      # options_via: api        # api=分组设置走子站接口，立即生效（默认）；db=直接写库
+      # options_via: api        # api=分组设置和模型价格走子站接口，立即生效（默认）；db=直接写库
 
   - name: child2
     # enabled: false            # 临时停止同步这个子站
     # dry_run: true             # 只看差异不写入（单独对这个子站生效）
     database:
       dsn: "${CHILD2_DSN}"
-    # 没有配置 api 时：渠道与分组直接写库，子站按自己的 SYNC_FREQUENCY 周期刷新后生效
+    # 没有配置 api 时：渠道、分组与模型价格直接写库，子站按自己的 SYNC_FREQUENCY 周期刷新后生效
 
 # ---------------- 同步节奏 ----------------
 sync:
@@ -70,9 +70,16 @@ channels:
 options:
   # enabled: true
   # 默认同步：GroupRatio, GroupGroupRatio, UserUsableGroups, AutoGroups, DefaultUseAutoGroup
-  # 以及 group_ratio_setting.* 前缀。需要同步更多设置时（例如模型倍率）在这里列出完整清单：
-  # keys: [GroupRatio, GroupGroupRatio, UserUsableGroups, AutoGroups, DefaultUseAutoGroup, ModelRatio]
+  # 以及 group_ratio_setting.* 前缀。需要同步更多设置时在这里列出完整清单：
+  # keys: [GroupRatio, GroupGroupRatio, UserUsableGroups, AutoGroups, DefaultUseAutoGroup]
   # key_prefixes: ["group_ratio_setting."]
+  # 注意：模型价格（ModelRatio、billing_setting.* 等）不要放在这里，由下面的 pricing 同步
+
+# ---------------- 模型价格 ----------------
+pricing:
+  # 子站的模型 1 倍价格与主站完全一致（表达式计费 + 还没迁到表达式的旧倍率、按次价格），
+  # 子站多出来的模型价格会删除。写入方式跟随子站的 api.options_via。QuotaPerUnit 永不同步。
+  # enabled: true
 
 # ---------------- 状态接口 ----------------
 http:

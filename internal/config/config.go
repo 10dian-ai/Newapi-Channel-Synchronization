@@ -16,6 +16,8 @@ import (
 	"time"
 
 	"gopkg.in/yaml.v3"
+
+	"github.com/10dian-ai/newapi-channel-synchronization/internal/pricing"
 )
 
 // 渠道状态同步模式。
@@ -35,7 +37,7 @@ const (
 	RefreshNone = "none"
 )
 
-// 分组设置（options）写入方式。
+// 分组设置与模型价格（都在 options 表里）的写入方式。
 const (
 	OptionsViaAPI = "api" // 走子站管理接口，立即生效并经过子站自身的校验
 	OptionsViaDB  = "db"  // 直接写子库，等子站 SYNC_FREQUENCY 周期后生效
@@ -78,6 +80,7 @@ type Config struct {
 	Sync     SyncConfig     `yaml:"sync"`
 	Channels ChannelsConfig `yaml:"channels"`
 	Options  OptionsConfig  `yaml:"options"`
+	Pricing  PricingConfig  `yaml:"pricing"`
 	HTTP     HTTPConfig     `yaml:"http"`
 	Log      LogConfig      `yaml:"log"`
 	Notify   NotifyConfig   `yaml:"notify"`
@@ -122,7 +125,7 @@ type APIConfig struct {
 	Timeout Duration `yaml:"timeout"`
 	// RefreshChannels 渠道写入后的刷新方式：fix / none。默认：配置了 API 时为 fix。
 	RefreshChannels string `yaml:"refresh_channels"`
-	// OptionsVia 分组设置写入方式：api / db。默认：配置了 API 时为 api。
+	// OptionsVia 分组设置与模型价格的写入方式：api / db。默认：配置了 API 时为 api。
 	OptionsVia string `yaml:"options_via"`
 }
 
@@ -220,6 +223,31 @@ type OptionsConfig struct {
 
 // IsEnabled 报告是否同步分组设置。
 func (o OptionsConfig) IsEnabled() bool { return o.Enabled == nil || *o.Enabled }
+
+// covers 报告某个 option key 是否落在 options 同步范围内。
+func (o OptionsConfig) covers(key string) bool {
+	for _, k := range o.Keys {
+		if strings.TrimSpace(k) == key {
+			return true
+		}
+	}
+	for _, p := range o.KeyPrefixes {
+		if p = strings.TrimSpace(p); p != "" && strings.HasPrefix(key, p) {
+			return true
+		}
+	}
+	return false
+}
+
+// PricingConfig 控制模型价格（1 倍价格）同步。开启后子站的模型价格与主站完全一致，
+// 包括表达式计费和还没迁移到表达式的旧倍率、按次价格。写入方式跟随子站的 api.options_via。
+type PricingConfig struct {
+	// Enabled 是否同步模型价格，默认 true。
+	Enabled *bool `yaml:"enabled"`
+}
+
+// IsEnabled 报告是否同步模型价格。
+func (p PricingConfig) IsEnabled() bool { return p.Enabled == nil || *p.Enabled }
 
 // HTTPConfig 是状态接口配置。
 type HTTPConfig struct {
@@ -516,6 +544,17 @@ func (c *Config) Validate() error {
 	for _, p := range c.Options.KeyPrefixes {
 		if strings.TrimSpace(p) == "" {
 			add("options.key_prefixes 中不能有空值（空前缀会匹配全部设置）")
+		}
+	}
+	if c.Options.IsEnabled() {
+		// 价格设置按原文比较会反复同步（新版 NewAPI 写入后会重新编码），必须交给 pricing 同步
+		for _, k := range pricing.Keys {
+			if c.Options.covers(k) {
+				add("options 同步范围包含模型价格设置 %s：模型价格请交给 pricing 同步，从 options.keys / key_prefixes 中去掉它", k)
+			}
+		}
+		if c.Options.covers(pricing.KeyQuotaPerUnit) {
+			add("options 同步范围不能包含 %s：它决定每 1 美元对应多少额度，同步它会让子站用户余额的价值跟着变", pricing.KeyQuotaPerUnit)
 		}
 	}
 	switch strings.ToLower(c.Log.Level) {

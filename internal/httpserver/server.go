@@ -142,6 +142,7 @@ func (s *Server) metrics(w http.ResponseWriter, _ *http.Request) {
 		fmt.Fprintf(&b, "newapi_sync_child_writes_total{child=%q,kind=\"update\"} %d\n", c.Name, c.Updated)
 		fmt.Fprintf(&b, "newapi_sync_child_writes_total{child=%q,kind=\"delete\"} %d\n", c.Name, c.Deleted)
 		fmt.Fprintf(&b, "newapi_sync_child_writes_total{child=%q,kind=\"option\"} %d\n", c.Name, c.OptionWrites)
+		fmt.Fprintf(&b, "newapi_sync_child_writes_total{child=%q,kind=\"pricing\"} %d\n", c.Name, c.PricingWrites)
 	}
 	_, _ = w.Write([]byte(b.String()))
 }

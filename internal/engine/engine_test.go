@@ -2,9 +2,12 @@ package engine
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -13,6 +16,7 @@ import (
 	"github.com/10dian-ai/newapi-channel-synchronization/internal/dbx"
 	"github.com/10dian-ai/newapi-channel-synchronization/internal/newapidb"
 	"github.com/10dian-ai/newapi-channel-synchronization/internal/notify"
+	"github.com/10dian-ai/newapi-channel-synchronization/internal/pricing"
 	"github.com/10dian-ai/newapi-channel-synchronization/internal/reconcile"
 	"github.com/10dian-ai/newapi-channel-synchronization/internal/snapshot"
 	"github.com/10dian-ai/newapi-channel-synchronization/internal/target"
@@ -53,12 +57,15 @@ func (f *fakeMaster) Probe(context.Context) (string, bool, error) {
 func (f *fakeMaster) Load(context.Context, bool) (*snapshot.Master, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	cp := &snapshot.Master{Channels: snapshot.Table{Columns: chanCols, Rows: map[int64]snapshot.Row{}}, Options: map[string]string{}}
+	cp := &snapshot.Master{Channels: snapshot.Table{Columns: chanCols, Rows: map[int64]snapshot.Row{}}, Options: map[string]string{}, Pricing: map[string]string{}}
 	for id, r := range f.snap.Channels.Rows {
 		cp.Channels.Rows[id] = r.Clone()
 	}
 	for k, v := range f.snap.Options {
 		cp.Options[k] = v
+	}
+	for k, v := range f.snap.Pricing {
+		cp.Pricing[k] = v
 	}
 	return cp, nil
 }
@@ -80,7 +87,7 @@ type fakeStore struct {
 
 func newFakeStore() *fakeStore {
 	return &fakeStore{
-		state:  &snapshot.Child{Channels: snapshot.Table{Columns: chanCols, Rows: map[int64]snapshot.Row{}}, Options: map[string]string{}},
+		state:  &snapshot.Child{Channels: snapshot.Table{Columns: chanCols, Rows: map[int64]snapshot.Row{}}, Options: map[string]string{}, Pricing: map[string]string{}},
 		schema: newapidb.Schema{Channels: chanCols, Abilities: abilityCols, Options: optionCols},
 	}
 }
@@ -91,15 +98,20 @@ func (f *fakeStore) Schema(context.Context) (newapidb.Schema, error) {
 	return f.schema, nil
 }
 
-func (f *fakeStore) Load(context.Context, newapidb.Schema, target.LoadOptions) (*snapshot.Child, error) {
+func (f *fakeStore) Load(_ context.Context, _ newapidb.Schema, opt target.LoadOptions) (*snapshot.Child, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	cp := &snapshot.Child{Channels: snapshot.Table{Columns: chanCols, Rows: map[int64]snapshot.Row{}}, Options: map[string]string{}}
+	cp := &snapshot.Child{Channels: snapshot.Table{Columns: chanCols, Rows: map[int64]snapshot.Row{}}, Options: map[string]string{}, Pricing: map[string]string{}}
 	for id, r := range f.state.Channels.Rows {
 		cp.Channels.Rows[id] = r.Clone()
 	}
 	for k, v := range f.state.Options {
 		cp.Options[k] = v
+	}
+	if opt.Pricing {
+		for k, v := range f.state.Pricing {
+			cp.Pricing[k] = v
+		}
 	}
 	return cp, nil
 }
@@ -130,8 +142,15 @@ func (f *fakeStore) Apply(_ context.Context, plan *reconcile.Plan, _ newapidb.Sc
 		for _, o := range plan.Options {
 			f.state.Options[o.Key] = o.Value
 		}
+		for _, c := range plan.Pricing.Changes {
+			f.state.Pricing[c.Key] = c.Value
+		}
 	}
-	return target.Result{Inserted: len(plan.Inserts), Updated: len(plan.Updates), Deleted: len(plan.Deletes)}, nil
+	res := target.Result{Inserted: len(plan.Inserts), Updated: len(plan.Updates), Deleted: len(plan.Deletes)}
+	if opt.WriteOptions {
+		res.Pricing = len(plan.Pricing.Changes)
+	}
+	return res, nil
 }
 
 type fakeAPI struct {
@@ -140,6 +159,10 @@ type fakeAPI struct {
 	fixes   int
 	failFix int
 	options []string
+	// pricing 记录写入的模型价格设置项（按顺序）
+	pricing []string
+	// rejectPricing 不为空时，子站拒绝所有价格写入并返回这个错误信息
+	rejectPricing string
 }
 
 func (f *fakeAPI) Version(context.Context) (string, error) { return "v-test", nil }
@@ -156,12 +179,53 @@ func (f *fakeAPI) FixAbilities(context.Context) (int, int, error) {
 }
 
 func (f *fakeAPI) UpdateOption(_ context.Context, k, v string) error {
+	if pricing.IsKey(k) {
+		return f.updatePricing(k, v)
+	}
 	f.mu.Lock()
 	f.options = append(f.options, k)
 	f.mu.Unlock()
 	f.store.mu.Lock()
 	f.store.state.Options[k] = v // 真实子站会写库，这里同样写入，便于写后校验
 	f.store.mu.Unlock()
+	return nil
+}
+
+// updatePricing 模拟新版 NewAPI 写入一项价格：按模型校验（tiered_expr 必须有表达式），
+// 然后把全部 11 个价格设置项重新编码后写回库里，缺的设置项按默认值（这里用空表）补上。
+func (f *fakeAPI) updatePricing(k, v string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.rejectPricing != "" {
+		return errors.New(f.rejectPricing)
+	}
+	f.store.mu.Lock()
+	defer f.store.mu.Unlock()
+	values := map[string]map[string]any{}
+	for _, key := range pricing.Keys {
+		obj := map[string]any{}
+		if raw, ok := f.store.state.Pricing[key]; ok && strings.TrimSpace(raw) != "" {
+			if err := json.Unmarshal([]byte(raw), &obj); err != nil {
+				return err
+			}
+		}
+		values[key] = obj
+	}
+	next := map[string]any{}
+	if err := json.Unmarshal([]byte(v), &next); err != nil || next == nil {
+		return fmt.Errorf("%s must be a JSON object", k)
+	}
+	values[k] = next
+	for name, mode := range values[pricing.KeyBillingMode] {
+		if _, ok := values[pricing.KeyBillingExpr][name]; mode == "tiered_expr" && !ok {
+			return fmt.Errorf("model %s: billing expression is required", name)
+		}
+	}
+	for key, obj := range values {
+		b, _ := json.Marshal(obj)
+		f.store.state.Pricing[key] = string(b)
+	}
+	f.pricing = append(f.pricing, k)
 	return nil
 }
 
@@ -321,13 +385,15 @@ func TestEngineEndToEnd(t *testing.T) {
 		m.Channels.Rows[2] = snapshot.Row{"id": sv("2"), "key": sv("k2"), "status": sv("2"), "models": sv("m2"), "group": sv("vip"), "priority": sv("1"), "used_quota": sv("0")}
 		m.Channels.Rows[1]["priority"] = sv("9")
 		m.Options["GroupRatio"] = `{"default":1,"vip":2}`
+		m.Pricing = map[string]string{"ModelRatio": `{"m1": 2.5, "m2": 0.5}`}
 	})
 	start := time.Now()
 	waitFor(t, "增量同步", func() bool {
 		store.mu.Lock()
 		defer store.mu.Unlock()
 		r1, r2 := store.state.Channels.Rows[1], store.state.Channels.Rows[2]
-		return r2 != nil && r2.String("status") == "2" && r1.String("priority") == "9" && store.state.Options["GroupRatio"] == `{"default":1,"vip":2}`
+		return r2 != nil && r2.String("status") == "2" && r1.String("priority") == "9" && store.state.Options["GroupRatio"] == `{"default":1,"vip":2}` &&
+			pricing.Equal(store.state.Pricing["ModelRatio"], `{"m1":2.5,"m2":0.5}`)
 	})
 	t.Logf("增量同步耗时 %v", time.Since(start))
 
@@ -352,4 +418,138 @@ func waitFor(t *testing.T, what string, cond func() bool) {
 		time.Sleep(10 * time.Millisecond)
 	}
 	t.Fatalf("等待超时：%s", what)
+}
+
+// masterPricing 是主站库里的模型价格：原文带缩进（旧版本或手工保存的样子），
+// 一个模型用表达式计费，其他模型还是旧倍率。
+func masterPricing() map[string]string {
+	return map[string]string{
+		"ModelRatio":                 "{\n  \"gpt-4o\": 1.25,\n  \"o3\": 5\n}",
+		"CompletionRatio":            `{"gpt-4o": 4}`,
+		pricing.KeyBillingMode:       `{"gpt-6-astra": "tiered_expr"}`,
+		pricing.KeyBillingExpr:       `{"gpt-6-astra": "tier(\"standard\", p * 10 + c * 50)"}`,
+		pricing.KeyQuotaPerUnit:      "500000",
+		pricing.KeyPluginBillingExpr: `{}`,
+	}
+}
+
+func pricingEqual(t *testing.T, master, child map[string]string) {
+	t.Helper()
+	for _, k := range pricing.Keys {
+		mv, ok := master[k]
+		if !ok {
+			continue
+		}
+		if !pricing.Equal(mv, child[k]) {
+			t.Fatalf("模型价格 %s 未同步：主站 %s，子站 %s", k, mv, child[k])
+		}
+	}
+}
+
+// TestPricingSyncViaAPIIsStable：子站接口写入后会重新编码价格（新版 NewAPI 的行为），
+// 写后校验仍然通过，下一轮也不会再重复写入；子站多出来的模型价格被删除。
+func TestPricingSyncViaAPIIsStable(t *testing.T) {
+	cfg := testConfig(true)
+	store := newFakeStore()
+	store.state.Pricing = map[string]string{
+		"ModelRatio":           `{"gpt-4o":9,"child-only":1}`,
+		pricing.KeyBillingMode: `{"retired":"tiered_expr"}`,
+		pricing.KeyBillingExpr: `{"retired":"tier(\"base\", p)"}`,
+	}
+	api := &fakeAPI{store: store}
+	w, st := newTestWorker(cfg, store, api)
+	snap := masterSnap()
+	snap.Pricing = masterPricing()
+	snap.Full = true
+
+	if err := w.syncOnce(context.Background(), snap); err != nil {
+		t.Fatal(err)
+	}
+	pricingEqual(t, snap.Pricing, store.state.Pricing)
+	if strings.Contains(store.state.Pricing["ModelRatio"], "child-only") {
+		t.Fatal("子站多出来的模型价格应被删除")
+	}
+	if got := strings.Join(api.pricing, ","); !strings.HasPrefix(got, pricing.KeyBillingExpr+",") || !strings.HasSuffix(got, ","+pricing.KeyBillingExpr) {
+		t.Fatalf("表达式应先补后删：%s", got)
+	}
+	writes := len(api.pricing)
+	c := st.Snapshot().Children[0]
+	if c.State != StateOK || c.PricingWrites != int64(writes) {
+		t.Fatalf("状态不对：%+v", c)
+	}
+	// 子站把 11 项都建出来了，主站库里只有其中几项：其余的保持子站原样并列在状态里
+	if len(c.PricingNotInMaster) == 0 {
+		t.Fatal("应列出主站库里没有的价格设置项")
+	}
+
+	if err := w.syncOnce(context.Background(), snap); err != nil {
+		t.Fatal(err)
+	}
+	if len(api.pricing) != writes {
+		t.Fatalf("价格已一致，不应重复写入：%v", api.pricing)
+	}
+}
+
+func TestPricingSyncViaDB(t *testing.T) {
+	cfg := testConfig(false)
+	store := newFakeStore()
+	store.state.Pricing = map[string]string{"ModelRatio": `{"old":1}`, pricing.KeyQuotaPerUnit: "1000000"}
+	w, st := newTestWorker(cfg, store, nil)
+	snap := masterSnap()
+	snap.Pricing = masterPricing()
+	if err := w.syncOnce(context.Background(), snap); err != nil {
+		t.Fatal(err)
+	}
+	pricingEqual(t, snap.Pricing, store.state.Pricing)
+	if store.state.Pricing[pricing.KeyQuotaPerUnit] != "1000000" {
+		t.Fatal("QuotaPerUnit 永远不能被同步")
+	}
+	c := st.Snapshot().Children[0]
+	if c.PricingWrites != 5 {
+		t.Fatalf("直接写库应写入 5 项价格，got %d", c.PricingWrites)
+	}
+	var warned bool
+	for _, warn := range c.LastWarnings {
+		warned = warned || strings.Contains(warn, "QuotaPerUnit")
+	}
+	if !warned {
+		t.Fatalf("QuotaPerUnit 不一致应提醒：%v", c.LastWarnings)
+	}
+}
+
+func TestPricingDisabled(t *testing.T) {
+	cfg := testConfig(false)
+	off := false
+	cfg.Pricing.Enabled = &off
+	store := newFakeStore()
+	store.state.Pricing = map[string]string{"ModelRatio": `{"old":1}`}
+	w, _ := newTestWorker(cfg, store, nil)
+	snap := masterSnap()
+	snap.Pricing = masterPricing()
+	if err := w.syncOnce(context.Background(), snap); err != nil {
+		t.Fatal(err)
+	}
+	if store.state.Pricing["ModelRatio"] != `{"old":1}` {
+		t.Fatal("关闭价格同步后不应改动子站价格")
+	}
+}
+
+// TestPricingRejectedByChild：子站拒绝价格时报错（带上设置项名称），渠道照常同步。
+func TestPricingRejectedByChild(t *testing.T) {
+	cfg := testConfig(true)
+	store := newFakeStore()
+	api := &fakeAPI{store: store, rejectPricing: "Invalid billing expression for model gpt-6-astra"}
+	w, st := newTestWorker(cfg, store, api)
+	snap := masterSnap()
+	snap.Pricing = masterPricing()
+	err := w.syncOnce(context.Background(), snap)
+	if err == nil || !strings.Contains(err.Error(), "模型价格") || !strings.Contains(err.Error(), "gpt-6-astra") {
+		t.Fatalf("应报告价格写入失败，got %v", err)
+	}
+	if store.state.Channels.Rows[1] == nil || store.state.Options["GroupRatio"] == "" {
+		t.Fatal("价格失败不应影响渠道和分组同步")
+	}
+	if c := st.Snapshot().Children[0]; c.State == StateOK {
+		t.Fatalf("价格没同步上时状态不能是 ok：%+v", c)
+	}
 }

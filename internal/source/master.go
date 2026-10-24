@@ -20,6 +20,8 @@ import (
 type Master struct {
 	db      *dbx.DB
 	matcher newapidb.OptionMatcher
+	// pricing 是模型价格相关的设置项，为空表示不同步价格。
+	pricing newapidb.OptionMatcher
 	// probeExclude 是探测时忽略的列（主站自己的运行时数据，例如已用额度），
 	// 它们每次请求都可能变化，但与同步无关，不应触发同步。
 	probeExclude map[string]bool
@@ -38,8 +40,9 @@ type probeQuery struct {
 	args []any
 }
 
-// New 创建主站数据源。db 必须以只读方式打开。
-func New(db *dbx.DB, matcher newapidb.OptionMatcher, probeExclude []string) (*Master, error) {
+// New 创建主站数据源。db 必须以只读方式打开。matcher 是分组设置的范围，pricing 是模型价格设置项的范围
+// （为空表示不同步价格）。
+func New(db *dbx.DB, matcher, pricing newapidb.OptionMatcher, probeExclude []string) (*Master, error) {
 	if !db.ReadOnly {
 		return nil, fmt.Errorf("主站连接必须以只读方式打开")
 	}
@@ -47,7 +50,7 @@ func New(db *dbx.DB, matcher newapidb.OptionMatcher, probeExclude []string) (*Ma
 	for _, c := range probeExclude {
 		ex[c] = true
 	}
-	return &Master{db: db, matcher: matcher, probeExclude: ex}, nil
+	return &Master{db: db, matcher: matcher, pricing: pricing, probeExclude: ex}, nil
 }
 
 // RefreshSchema 重新读取主站表结构并重建探测查询。
@@ -91,12 +94,17 @@ func (m *Master) buildProbes(schema newapidb.Schema) []probeQuery {
 		exprs = append(exprs, e)
 	}
 	probes := []probeQuery{{sql: d.ChecksumQuery(newapidb.TableChannels, exprs, "")}}
-	if len(schema.Options) > 0 && !m.matcher.Empty() {
-		where, args := m.matcher.WhereClause(d, 1)
-		probes = append(probes, probeQuery{
-			sql:  d.ChecksumQuery(newapidb.TableOptions, []string{d.Quote(newapidb.OptionKeyCol), d.Quote(newapidb.OptionValueCol)}, where),
-			args: args,
-		})
+	if len(schema.Options) > 0 {
+		for _, matcher := range []newapidb.OptionMatcher{m.matcher, m.pricing} {
+			if matcher.Empty() {
+				continue
+			}
+			where, args := matcher.WhereClause(d, 1)
+			probes = append(probes, probeQuery{
+				sql:  d.ChecksumQuery(newapidb.TableOptions, []string{d.Quote(newapidb.OptionKeyCol), d.Quote(newapidb.OptionValueCol)}, where),
+				args: args,
+			})
+		}
 	}
 	return probes
 }
@@ -140,7 +148,7 @@ func (m *Master) Probe(ctx context.Context) (checksum string, supported bool, er
 	return strings.Join(parts, "|"), true, nil
 }
 
-// Load 在一个只读事务里读取完整快照，保证渠道与设置来自同一时刻。
+// Load 在一个只读事务里读取完整快照，保证渠道、分组设置与模型价格来自同一时刻。
 func (m *Master) Load(ctx context.Context, withOptions bool) (*snapshot.Master, error) {
 	m.mu.Lock()
 	schema := m.schema
@@ -160,11 +168,17 @@ func (m *Master) Load(ctx context.Context, withOptions bool) (*snapshot.Master, 
 	if err != nil {
 		return nil, err
 	}
-	snap := &snapshot.Master{Channels: channels, Options: map[string]string{}, LoadedAt: time.Now()}
+	snap := &snapshot.Master{Channels: channels, Options: map[string]string{}, Pricing: map[string]string{}}
 	if withOptions && len(schema.Options) > 0 {
 		if snap.Options, err = newapidb.ReadOptions(ctx, tx, m.db.Dialect, m.matcher); err != nil {
 			return nil, err
 		}
 	}
+	if len(schema.Options) > 0 && !m.pricing.Empty() {
+		if snap.Pricing, err = newapidb.ReadOptions(ctx, tx, m.db.Dialect, m.pricing); err != nil {
+			return nil, fmt.Errorf("读取模型价格失败：%w", err)
+		}
+	}
+	snap.LoadedAt = time.Now()
 	return snap, nil
 }

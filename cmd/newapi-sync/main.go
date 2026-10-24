@@ -123,18 +123,21 @@ func runCheck(ctx context.Context, a *app.App) int {
 	snap := a.Status.Snapshot()
 	fmt.Println()
 	fmt.Println("========== 检查结果 ==========")
-	fmt.Printf("主站：渠道 %d 条，分组设置 %d 项\n", snap.Master.Channels, snap.Master.Options)
+	fmt.Printf("主站：渠道 %d 条，分组设置 %d 项，模型价格设置 %d 项\n", snap.Master.Channels, snap.Master.Options, snap.Master.Pricing)
 	for _, c := range snap.Children {
 		fmt.Printf("\n子站 %s\n", c.Name)
 		if c.Version != "" {
 			fmt.Printf("  版本：%s\n", c.Version)
 		}
-		fmt.Printf("  渠道刷新方式：%s，分组设置写入方式：%s\n", c.RefreshChannels, c.OptionsVia)
+		fmt.Printf("  渠道刷新方式：%s，分组设置与模型价格写入方式：%s\n", c.RefreshChannels, c.OptionsVia)
 		if len(c.MissingInChild) > 0 {
 			fmt.Printf("  主站有、子站没有的列（无法同步，子站版本较旧）：%s\n", strings.Join(c.MissingInChild, ", "))
 		}
 		if len(c.ChildOnlyColumns) > 0 {
 			fmt.Printf("  子站独有的列（保持子站自己的值）：%s\n", strings.Join(c.ChildOnlyColumns, ", "))
+		}
+		if len(c.PricingNotInMaster) > 0 {
+			fmt.Printf("  主站库里没有的模型价格设置（子站保持原样；在主站后台保存一次价格即可补上）：%s\n", strings.Join(c.PricingNotInMaster, ", "))
 		}
 		if c.LastError != "" {
 			fmt.Printf("  错误：%s\n", c.LastError)
@@ -142,11 +145,11 @@ func runCheck(ctx context.Context, a *app.App) int {
 		}
 		if c.LastPlan == "" {
 			fmt.Println("  已与主站一致，无需变更")
-			continue
-		}
-		fmt.Printf("  %s\n", c.LastPlan)
-		for _, d := range c.LastDetails {
-			fmt.Printf("    - %s\n", d)
+		} else {
+			fmt.Printf("  %s\n", c.LastPlan)
+			for _, d := range c.LastDetails {
+				fmt.Printf("    - %s\n", d)
+			}
 		}
 		for _, w := range c.LastWarnings {
 			fmt.Printf("  注意：%s\n", w)

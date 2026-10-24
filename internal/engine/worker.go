@@ -202,18 +202,20 @@ func (w *worker) doSync(ctx context.Context, snap *snapshot.Master) error {
 	}
 
 	syncOptions := w.cfg.Options.IsEnabled()
+	syncPricing := w.cfg.Pricing.IsEnabled() && len(w.schema.Options) > 0
 	cp := reconcile.BuildColumnPlan(snap.Channels.Columns, w.schema.Channels, w.cfg.Channels.OwnedColumns())
 	diffOpt := reconcile.DiffOptions{
 		StatusMode:       w.cfg.Channels.StatusMode,
 		DeleteMissing:    w.cfg.Sync.ShouldDeleteMissing(),
 		SyncOptions:      syncOptions && len(w.schema.Options) > 0,
+		SyncPricing:      syncPricing,
 		ExcludeType:      w.cfg.Channels.Excluded,
 		DeleteGuardRatio: w.cfg.Sync.GuardRatio(),
 		DeleteGuardMin:   w.cfg.Sync.DeleteGuardMin,
 		// 能力表由同步服务负责时（没有用子站修复接口）才校验；否则以子站自己的重建结果为准
 		CheckAbilities: w.abilitiesWritable && w.child.API.RefreshChannels != config.RefreshFix,
 	}
-	loadOpt := target.LoadOptions{Options: diffOpt.SyncOptions, Abilities: diffOpt.CheckAbilities}
+	loadOpt := target.LoadOptions{Options: diffOpt.SyncOptions, Pricing: diffOpt.SyncPricing, Abilities: diffOpt.CheckAbilities}
 	state, err := w.store.Load(ctx, w.schema, loadOpt)
 	if err != nil {
 		return fmt.Errorf("读取子站失败：%w", err)
@@ -222,6 +224,9 @@ func (w *worker) doSync(ctx context.Context, snap *snapshot.Master) error {
 	w.handleWarnings(ctx, plan.Warnings)
 	if len(plan.OrphanOptions) > 0 && snap.Full {
 		w.log.Info("子站有主站没有的分组设置项，已保留不动", "keys", plan.OrphanOptions)
+	}
+	if len(plan.Pricing.NotInMaster) > 0 && snap.Full {
+		w.log.Info("主站库里没有这些模型价格设置项（主站从没保存过，或主站版本还没有这个功能），子站保持原样", "keys", plan.Pricing.NotInMaster)
 	}
 
 	if plan.Empty() && !w.pendingRefresh {
@@ -245,6 +250,7 @@ func (w *worker) doSync(ctx context.Context, snap *snapshot.Master) error {
 			c.LastPlan = "（演练，未写入）" + plan.Summary()
 			c.LastDetails = limit(details, maxDetails)
 			c.LastWarnings = plan.Warnings
+			c.PricingNotInMaster = plan.Pricing.NotInMaster
 			c.LastError = ""
 		})
 		return nil
@@ -280,6 +286,15 @@ func (w *worker) doSync(ctx context.Context, snap *snapshot.Master) error {
 			res.Options++
 		}
 	}
+	if !optionsViaDB && len(plan.Pricing.Writes) > 0 {
+		// 逐项写入，顺序由 pricing 包安排，保证每一步都能通过子站的价格校验
+		for _, wr := range plan.Pricing.Writes {
+			if err := w.api.UpdateOption(ctx, wr.Key, wr.Value); err != nil {
+				return fmt.Errorf("通过子站接口写入模型价格 %s 失败：%w", wr.Key, err)
+			}
+			res.Pricing++
+		}
+	}
 
 	// 写后校验：重新读取子站，确认已经与主站一致
 	after, err := w.store.Load(ctx, w.schema, loadOpt)
@@ -287,19 +302,22 @@ func (w *worker) doSync(ctx context.Context, snap *snapshot.Master) error {
 		return fmt.Errorf("写后校验读取子站失败：%w", err)
 	}
 	remain := reconcile.Diff(snap, after, cp, diffOpt)
-	if remain.ChannelsChanged() || len(remain.Options) > 0 {
+	if remain.ChannelsChanged() || len(remain.Options) > 0 || !remain.Pricing.Empty() {
 		return fmt.Errorf("写后校验未通过，仍有差异：%s", remain.Summary())
 	}
 	if len(remain.AbilityRepairs) > 0 {
 		// 渠道已经一致，只是能力表还有出入（例如子站在这期间又改了渠道状态）：下一轮会再修，不算失败
 		w.log.Warn("写后校验发现能力表仍有不一致，下一轮同步会继续修复", "channels", remain.AbilityRepairs)
 	}
+	// 新版子站写入任意一项价格后会把全部价格设置项都建出来，以写入后的状态为准
+	plan.Pricing.NotInMaster = remain.Pricing.NotInMaster
 
 	w.status.updateChild(w.name, func(c *ChildStatus) {
 		c.Inserted += int64(res.Inserted)
 		c.Updated += int64(res.Updated)
 		c.Deleted += int64(res.Deleted)
 		c.OptionWrites += int64(res.Options)
+		c.PricingWrites += int64(res.Pricing)
 		c.LastDetails = limit(details, maxDetails)
 		c.LastChangeAppliedAt = ptrTime(time.Now())
 	})
@@ -394,6 +412,7 @@ func (w *worker) markSynced(snap *snapshot.Master, plan *reconcile.Plan, state *
 		c.Channels = len(state.Channels.Rows)
 		c.MissingInChild = cp.MissingInChild
 		c.ChildOnlyColumns = cp.ChildOnly
+		c.PricingNotInMaster = plan.Pricing.NotInMaster
 		c.LastWarnings = plan.Warnings
 		if applied {
 			c.LastLagMillis = lagOf(snap).Milliseconds()
